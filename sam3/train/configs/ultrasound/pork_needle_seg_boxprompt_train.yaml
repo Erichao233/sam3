@@ -6,10 +6,10 @@ defaults:
 # Paths Configuration (change these to your own paths)
 # ============================================================================
 paths:
-  dataset_root: /path/to/pork_dataset
-  experiment_log_dir: /path/to/exp_logs/pork_needle_seg_boxprompt
-  bpe_path: /path/to/sam3/assets/bpe_simple_vocab_16e6.txt.gz
-  sam3_ckpt_path: /path/to/sam3.pt
+  dataset_root: /home2020/home/icube/kunyuan/SurgBench/Ultrasound/pork_dataset
+  experiment_log_dir: /home2020/home/icube/kunyuan/SurgBench/SAM/outputs/sam3_us_needle_detection_boxprompt
+  bpe_path: /home2020/home/icube/kunyuan/SurgBench/SAM/sam3/sam3/assets/bpe_simple_vocab_16e6.txt.gz
+  sam3_ckpt_path: /home2020/home/icube/kunyuan/SurgBench/SAM/sam3/sam3.pt
 
 ultrasound_train:
   prompts: '[{"id": 1, "name": "ultrasound needle"}]'
@@ -160,6 +160,10 @@ scratch:
 
 trainer:
   _target_: sam3.train.trainer.Trainer
+  env_variables:
+    # Work around DDP "Expected to have finished reduction" when some forward outputs are
+    # conditionally unused in loss for a subset of ranks/iterations.
+    SAM3_DDP_FORCE_OUTPUTS_IN_LOSS: "1"
   skip_saving_ckpts: false
   empty_gpu_mem_cache_after_eval: True
   skip_first_val: True
@@ -171,6 +175,8 @@ trainer:
 
   distributed:
     backend: nccl
+    # Box-prompt + segmentation can have per-batch control flow where some heads/paths
+    # don't contribute to loss on every rank; enable unused parameter detection for DDP.
     find_unused_parameters: True
     gradient_as_bucket_view: True
 

@@ -7,6 +7,8 @@ import sys
 import traceback
 from argparse import ArgumentParser
 from copy import deepcopy
+from getpass import getuser
+
 
 import submitit
 import torch
@@ -42,6 +44,28 @@ def handle_custom_resolving(cfg):
     return cfg_resolved
 
 
+def _set_triton_cache_dir_if_unset(local_rank: int) -> None:
+    """
+    Triton JIT caches compiled artifacts under ~/.triton by default.
+    On shared/NFS home this can be flaky under multi-process training.
+    Prefer a per-rank, node-local cache directory if not explicitly set.
+    """
+    if os.environ.get("TRITON_CACHE_DIR"):
+        return
+
+    base_dir = os.environ.get("SLURM_TMPDIR")
+    if not base_dir:
+        base_dir = os.path.join("/tmp", getuser())
+
+    job_id = os.environ.get("SLURM_JOB_ID", "nojob")
+    cache_dir = os.path.join(base_dir, "triton_cache", job_id, f"rank{local_rank}")
+    try:
+        os.makedirs(cache_dir, exist_ok=True)
+    except OSError:
+        return
+    os.environ["TRITON_CACHE_DIR"] = cache_dir
+
+
 def single_proc_run(local_rank, main_port, cfg, world_size):
     """Single GPU process"""
     os.environ["MASTER_ADDR"] = "localhost"
@@ -49,6 +73,8 @@ def single_proc_run(local_rank, main_port, cfg, world_size):
     os.environ["RANK"] = str(local_rank)
     os.environ["LOCAL_RANK"] = str(local_rank)
     os.environ["WORLD_SIZE"] = str(world_size)
+    _set_triton_cache_dir_if_unset(local_rank=local_rank)
+
     try:
         register_omegaconf_resolvers()
     except Exception as e:

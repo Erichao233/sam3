@@ -326,6 +326,9 @@ class RandomizeInputBbox:
             if query.input_bbox is None:
                 continue
 
+            if isinstance(query.input_bbox, torch.Tensor) and query.input_bbox.dim() == 1:
+                query.input_bbox = query.input_bbox.view(1, 4)
+                
             img = datapoint.images[query.image_id].data
             if isinstance(img, PILImage.Image):
                 w, h = img.size
