@@ -101,7 +101,15 @@ class Sam3LossWrapper(torch.nn.Module):
         for out, suffix, is_aux in output_list:
             # o2o matcher indices need to be computed by the model (as the video model requires
             # a specific way of matching free and locked indices beyond just calling the matcher)
-            indices = out["indices"]
+            indices = out.get("indices")
+            if indices is None:
+                if self.matcher is None:
+                    raise KeyError(
+                        "Missing `indices` in model outputs and no matcher is configured to compute them."
+                    )
+                # For image-only training/eval, indices can be computed on the fly.
+                indices = self.matcher(out, targets)
+                out["indices"] = indices
             has_o2m_out = "pred_logits_o2m" in out
             if has_o2m_out:
                 o2m_out = {

@@ -8,6 +8,8 @@ import torch.distributed
 import torch.nn.functional as F
 import torchmetrics
 
+import os
+
 from sam3.model import box_ops
 
 from sam3.model.data_misc import interpolate
@@ -26,6 +28,8 @@ from .mask_sampling import (
 
 
 CORE_LOSS_KEY = "core_loss"
+
+_TRITON_FOCAL_FALLBACK_WARNED = False
 
 
 def instance_masks_to_semantic_masks(
@@ -148,14 +152,29 @@ def sigmoid_focal_loss(
     Returns:
         Loss tensor
     """
+    if os.environ.get("SAM3_DISABLE_TRITON", "").strip() in {"1", "true", "True"}:
+        triton = False
+
     if not (0 <= alpha <= 1) and triton:
         raise RuntimeError(f"Alpha should be in [0,1], got {alpha}")
     if triton:
-        if reduce and not loss_on_multimask:
-            loss = triton_sigmoid_focal_loss_reduce(inputs, targets, alpha, gamma)
-            return loss / (num_boxes * inputs.shape[1])
+        try:
+            if reduce and not loss_on_multimask:
+                loss = triton_sigmoid_focal_loss_reduce(inputs, targets, alpha, gamma)
+                return loss / (num_boxes * inputs.shape[1])
 
-        loss = triton_sigmoid_focal_loss(inputs, targets, alpha, gamma)
+            loss = triton_sigmoid_focal_loss(inputs, targets, alpha, gamma)
+        except Exception:
+            # Triton can fail to JIT/launch on some clusters (e.g., shared FS cache,
+            # /tmp noexec, driver toolchain restrictions). Fall back to PyTorch.
+            global _TRITON_FOCAL_FALLBACK_WARNED
+            if not _TRITON_FOCAL_FALLBACK_WARNED:
+                _TRITON_FOCAL_FALLBACK_WARNED = True
+                logging.warning(
+                    "Triton sigmoid_focal_loss failed; falling back to PyTorch implementation. "
+                    "To disable Triton explicitly, set SAM3_DISABLE_TRITON=1."
+                )
+            triton = False
     else:
         prob = inputs.sigmoid()
         ce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction="none")

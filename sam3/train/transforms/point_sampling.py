@@ -1,6 +1,9 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates. All Rights Reserved
 
-import cv2
+try:
+    import cv2  # type: ignore
+except ModuleNotFoundError:  # pragma: no cover
+    cv2 = None
 import numpy as np
 import torch
 from PIL import Image as PILImage
@@ -70,6 +73,13 @@ def center_positive_sample(mask, n_points):
     sampled is treated as an edge for future points. Edges of the image are
     treated as edges of the mask.
     """
+
+    if cv2 is None:
+        raise ModuleNotFoundError(
+            "OpenCV (cv2) is required for `center_positive_sample` (distanceTransform). "
+            "Install it (e.g. `pip install opencv-python` or `conda install -c conda-forge opencv`) "
+            "or avoid transforms that use centered point sampling."
+        )
 
     # Pad mask by one pixel on each end to assure distance transform
     # avoids edges
@@ -325,6 +335,9 @@ class RandomizeInputBbox:
         for query in datapoint.find_queries:
             if query.input_bbox is None:
                 continue
+
+            if isinstance(query.input_bbox, torch.Tensor) and query.input_bbox.dim() == 1:
+                query.input_bbox = query.input_bbox.view(1, 4)
 
             img = datapoint.images[query.image_id].data
             if isinstance(img, PILImage.Image):

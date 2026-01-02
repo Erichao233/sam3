@@ -50,6 +50,7 @@ def convert_split(
     masks_subdir: str,
     category_id: int,
     category_name: str,
+    skip_empty: bool,
 ) -> dict:
     images_dir = dataset_root / images_subdir
     masks_dir = dataset_root / masks_subdir
@@ -83,6 +84,9 @@ def convert_split(
             with Image.open(mask_path) as m:
                 mask = np.array(m.convert("L"), dtype=np.uint8)
             mask = (mask > 0).astype(np.uint8)
+
+            if skip_empty and not mask.any():
+                continue
 
             coco["images"].append(
                 {
@@ -126,6 +130,11 @@ def main():
     ap.add_argument("--out-dir", type=str, default="annotations")
     ap.add_argument("--category-id", type=int, default=1)
     ap.add_argument("--category-name", type=str, default="ultrasound needle")
+    ap.add_argument(
+        "--skip-empty",
+        action="store_true",
+        help="If set, drop frames whose mask is empty (useful for box-prompted segmentation training).",
+    )
     args = ap.parse_args()
 
     dataset_root = Path(args.dataset_root).expanduser().resolve()
@@ -147,6 +156,7 @@ def main():
             masks_subdir=args.masks_subdir,
             category_id=args.category_id,
             category_name=args.category_name,
+            skip_empty=args.skip_empty,
         )
         out_path = out_dir / f"{split_name}.json"
         with out_path.open("w", encoding="utf-8") as f:

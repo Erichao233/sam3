@@ -7,6 +7,7 @@ import sys
 import traceback
 from argparse import ArgumentParser
 from copy import deepcopy
+from getpass import getuser
 
 import submitit
 import torch
@@ -42,6 +43,28 @@ def handle_custom_resolving(cfg):
     return cfg_resolved
 
 
+def _set_triton_cache_dir_if_unset(local_rank: int) -> None:
+    """
+    Triton JIT caches compiled artifacts under ~/.triton by default.
+    On shared/NFS home this can be flaky under multi-process training.
+    Prefer a per-rank, node-local cache directory if not explicitly set.
+    """
+    if os.environ.get("TRITON_CACHE_DIR"):
+        return
+
+    base_dir = os.environ.get("SLURM_TMPDIR")
+    if not base_dir:
+        base_dir = os.path.join("/tmp", getuser())
+
+    job_id = os.environ.get("SLURM_JOB_ID", "nojob")
+    cache_dir = os.path.join(base_dir, "triton_cache", job_id, f"rank{local_rank}")
+    try:
+        os.makedirs(cache_dir, exist_ok=True)
+    except OSError:
+        return
+    os.environ["TRITON_CACHE_DIR"] = cache_dir
+
+
 def single_proc_run(local_rank, main_port, cfg, world_size):
     """Single GPU process"""
     os.environ["MASTER_ADDR"] = "localhost"
@@ -49,6 +72,7 @@ def single_proc_run(local_rank, main_port, cfg, world_size):
     os.environ["RANK"] = str(local_rank)
     os.environ["LOCAL_RANK"] = str(local_rank)
     os.environ["WORLD_SIZE"] = str(world_size)
+    _set_triton_cache_dir_if_unset(local_rank=local_rank)
     try:
         register_omegaconf_resolvers()
     except Exception as e:
@@ -139,7 +163,7 @@ def add_pythonpath_to_sys_path():
 
 
 def main(args) -> None:
-    cfg = compose(config_name=args.config)
+    cfg = compose(config_name=args.config, overrides=getattr(args, "hydra_overrides", []))
     if cfg.launcher.experiment_log_dir is None:
         cfg.launcher.experiment_log_dir = os.path.join(
             os.getcwd(), "sam3_logs", args.config
@@ -333,7 +357,11 @@ if __name__ == "__main__":
         "--num-gpus", type=int, default=None, help="number of GPUS per node"
     )
     parser.add_argument("--num-nodes", type=int, default=None, help="Number of nodes")
-    args = parser.parse_args()
+    # Support Hydra-style overrides by accepting unknown args, e.g.:
+    #   python sam3/train/train.py -c <cfg.yaml> trainer.mode=val paths.dataset_root=/data
+    args, hydra_overrides = parser.parse_known_args()
     args.use_cluster = bool(args.use_cluster) if args.use_cluster is not None else None
     register_omegaconf_resolvers()
+    # Stash overrides on args so main() can pass them to hydra.compose()
+    args.hydra_overrides = hydra_overrides
     main(args)

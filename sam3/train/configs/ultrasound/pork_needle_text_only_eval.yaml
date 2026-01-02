@@ -1,0 +1,151 @@
+# @package _global_
+defaults:
+  - _self_
+
+paths:
+  dataset_root: /path/to/pork_dataset
+  experiment_log_dir: /path/to/exp_logs/pork_needle_text_only_eval
+  bpe_path: /path/to/sam3/assets/bpe_simple_vocab_16e6.txt.gz
+  sam3_ckpt_path: /path/to/sam3.pt
+
+ultrasound_train:
+  prompts: '[{"id": 1, "name": "ultrasound needle"}]'
+
+  val_transforms:
+    - _target_: sam3.train.transforms.basic_for_api.ComposeAPI
+      transforms:
+        - _target_: sam3.train.transforms.basic_for_api.RandomResizeAPI
+          sizes: ${scratch.resolution}
+          max_size:
+            _target_: sam3.train.transforms.basic.get_random_resize_max_size
+            size: ${scratch.resolution}
+          square: true
+          consistent_transform: False
+        - _target_: sam3.train.transforms.basic_for_api.ToTensorAPI
+        - _target_: sam3.train.transforms.basic_for_api.NormalizeAPI
+          mean: ${scratch.val_norm_mean}
+          std: ${scratch.val_norm_std}
+
+scratch:
+  enable_segmentation: False
+  resolution: 1008
+  val_norm_mean: [0.5, 0.5, 0.5]
+  val_norm_std: [0.5, 0.5, 0.5]
+  gather_pred_via_filesys: false
+
+  postprocessor_bbox:
+    _target_: sam3.eval.postprocessors.PostProcessImage
+    max_dets_per_img: 50
+    iou_type: "bbox"
+    use_original_ids: true
+    use_original_sizes_box: true
+    use_presence: True
+
+trainer:
+  _target_: sam3.train.trainer.Trainer
+  mode: val
+  accelerator: cuda
+  seed_value: 123
+  skip_saving_ckpts: true
+  empty_gpu_mem_cache_after_eval: True
+  skip_first_val: False
+  max_epochs: 1
+
+  distributed:
+    backend: nccl
+    find_unused_parameters: False
+    gradient_as_bucket_view: True
+
+  data:
+    val:
+      _target_: sam3.train.data.torch_dataset.TorchDataset
+      dataset:
+        _target_: sam3.train.data.sam3_image_dataset.Sam3ImageDataset
+        load_segmentation: ${scratch.enable_segmentation}
+        coco_json_loader:
+          _target_: sam3.train.data.coco_json_loaders.COCO_FROM_JSON
+          prompts: ${ultrasound_train.prompts}
+          include_negatives: true
+          category_chunk_size: 1
+          _partial_: true
+        img_folder: ${paths.dataset_root}/pork
+        ann_file: ${paths.dataset_root}/annotations/test.json
+        transforms: ${ultrasound_train.val_transforms}
+        max_ann_per_img: 100000
+        multiplier: 1
+        training: false
+      shuffle: False
+      batch_size: 1
+      num_workers: 4
+      pin_memory: False
+      drop_last: False
+      collate_fn:
+        _target_: sam3.train.data.collator.collate_fn_api
+        _partial_: true
+        repeats: 1
+        dict_key: all
+        with_seg_masks: ${scratch.enable_segmentation}
+
+  model:
+    _target_: sam3.model_builder.build_sam3_image_model
+    bpe_path: ${paths.bpe_path}
+    device: cpus
+    eval_mode: false
+    enable_segmentation: ${scratch.enable_segmentation}
+    load_from_HF: false
+    checkpoint_path: ${paths.sam3_ckpt_path}
+    freeze_vision_backbone: true
+    freeze_language_backbone: true
+
+  checkpoint:
+    save_dir: ${launcher.experiment_log_dir}/checkpoints
+    save_freq: 0
+    resume_from: null
+    skip_saving_parameters:
+      - 'backbone.vision_backbone.*'
+      - 'backbone.language_backbone.*'
+
+  meters:
+    val:
+      all:
+        bbox:
+          _target_: sam3.eval.coco_writer.PredictionDumper
+          iou_type: "bbox"
+          maxdets: 50
+          dump_dir: ${launcher.experiment_log_dir}/dumps/test/bbox
+          gather_pred_via_filesys: ${scratch.gather_pred_via_filesys}
+          merge_predictions: True
+          postprocessor: ${scratch.postprocessor_bbox}
+
+  loss:
+    all:
+      _target_: sam3.train.loss.sam3_loss.DummyLoss
+      device: cuda
+    default:
+      _target_: sam3.train.loss.sam3_loss.DummyLoss
+      device: cuda
+
+  optim: null
+
+  logging:
+    tensorboard_writer: null
+    wandb_writer: null
+    log_dir: ${launcher.experiment_log_dir}/logs_eval
+    log_freq: 10
+
+launcher:
+  num_nodes: 1
+  gpus_per_node: 1
+  experiment_log_dir: ${paths.experiment_log_dir}
+  multiprocessing_context: forkserver
+
+submitit:
+  account: null
+  partition: null
+  qos: null
+  timeout_hour: 4
+  use_cluster: False
+  cpus_per_task: 4
+  port_range: [10000, 65000]
+  constraint: null
+

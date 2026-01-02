@@ -56,6 +56,27 @@ from sam3.train.utils.train_utils import (
 
 
 CORE_LOSS_KEY = "core_loss"
+_FORCE_OUTPUTS_IN_LOSS_ENV = "SAM3_DDP_FORCE_OUTPUTS_IN_LOSS"
+
+
+def _sum_tensors_for_ddp_unused_detection(obj) -> torch.Tensor:
+    if torch.is_tensor(obj):
+        if obj.requires_grad:
+            return obj.sum()
+        return torch.zeros((), device=obj.device, dtype=obj.dtype)
+    if isinstance(obj, dict):
+        acc = None
+        for v in obj.values():
+            s = _sum_tensors_for_ddp_unused_detection(v)
+            acc = s if acc is None else acc + s
+        return acc if acc is not None else torch.zeros(())
+    if isinstance(obj, (list, tuple)):
+        acc = None
+        for v in obj:
+            s = _sum_tensors_for_ddp_unused_detection(v)
+            acc = s if acc is None else acc + s
+        return acc if acc is not None else torch.zeros(())
+    return torch.zeros(())
 
 
 def unwrap_ddp_if_wrapped(model):
@@ -448,10 +469,14 @@ class Trainer:
             ignore_missing_keys=self.checkpoint_conf.skip_saving_parameters,
         )
 
-        self.optim.optimizer.load_state_dict(checkpoint["optimizer"])
-        self.loss.load_state_dict(checkpoint["loss"], strict=True)
-        self.epoch = checkpoint["epoch"]
-        self.steps = checkpoint["steps"]
+        # Optimizer/loss states are optional (e.g. eval-only runs may set `optim: null`)
+        if self.optim is not None and "optimizer" in checkpoint:
+            self.optim.optimizer.load_state_dict(checkpoint["optimizer"])
+        if self.loss is not None and "loss" in checkpoint:
+            self.loss.load_state_dict(checkpoint["loss"], strict=True)
+
+        self.epoch = checkpoint.get("epoch", 0)
+        self.steps = checkpoint.get("steps", self.steps)
         self.ckpt_time_elapsed = checkpoint.get("time_elapsed")
 
         if self.optim_conf.amp.enabled and "scaler" in checkpoint:
@@ -518,6 +543,9 @@ class Trainer:
             loss = self._log_loss_detailed_and_return_core_loss(
                 loss, loss_log_str, self.steps[phase]
             )
+
+        if os.environ.get(_FORCE_OUTPUTS_IN_LOSS_ENV, "").strip() in {"1", "true", "True"}:
+            loss = loss + 0.0 * _sum_tensors_for_ddp_unused_detection(find_stages)
 
         if self.steps[phase] % self.logging_conf.log_scalar_frequency == 0:
             self.logger.log(

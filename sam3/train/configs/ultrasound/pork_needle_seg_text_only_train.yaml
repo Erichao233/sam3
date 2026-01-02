@@ -3,7 +3,7 @@ defaults:
   - _self_
 
 # ============================================================================
-# Paths Configuration (change these to your own paths)
+# Text-only segmentation training (no box prompt)
 # ============================================================================
 paths:
   dataset_root: /home2020/home/icube/kunyuan/SurgBench/Ultrasound/pork_dataset
@@ -20,6 +20,7 @@ ultrasound_train:
         - _target_: sam3.train.transforms.filter_query_transforms.FlexibleFilterFindGetQueries
           query_filter:
             _target_: sam3.train.transforms.filter_query_transforms.FilterCrowds
+        - _target_: sam3.train.transforms.segmentation.DecodeRle
         - _target_: sam3.train.transforms.basic_for_api.RandomResizeAPI
           sizes:
             _target_: sam3.train.transforms.basic.get_random_resize_scales
@@ -45,6 +46,7 @@ ultrasound_train:
   val_transforms:
     - _target_: sam3.train.transforms.basic_for_api.ComposeAPI
       transforms:
+        - _target_: sam3.train.transforms.segmentation.DecodeRle
         - _target_: sam3.train.transforms.basic_for_api.RandomResizeAPI
           sizes: ${scratch.resolution}
           max_size:
@@ -57,7 +59,6 @@ ultrasound_train:
           mean: ${scratch.val_norm_mean}
           std: ${scratch.val_norm_std}
 
-  # detection-only loss (no mask loss)
   loss:
     _target_: sam3.train.loss.sam3_loss.Sam3LossWrapper
     matcher: ${scratch.matcher}
@@ -85,11 +86,18 @@ ultrasound_train:
         pos_focal: ${scratch.iabce_pos_focal}
         pad_n_queries: ${scratch.num_queries}
         pad_scale_pos: ${scratch.instance_query_loss_pad_scale_pos}
+      - _target_: sam3.train.loss.loss_fns.Masks
+        focal_alpha: 0.25
+        focal_gamma: 2.0
+        weight_dict:
+          loss_mask: 200.0
+          loss_dice: 10.0
+        compute_aux: false
     loss_fn_semantic_seg: null
     scale_by_find_batch_size: ${scratch.scale_by_find_batch_size}
 
 scratch:
-  enable_segmentation: False
+  enable_segmentation: True
   resolution: 1008
   consistent_transform: False
   max_ann_per_img: 200
@@ -125,8 +133,7 @@ scratch:
   val_batch_size: 1
   num_train_workers: 8
   num_val_workers: 4
-  max_data_epochs: 40
-  target_epoch_size: 2000
+  max_data_epochs: 10
   hybrid_repeats: 1
   context_length: 2
 
@@ -141,12 +148,10 @@ scratch:
   scheduler_warmup: 20
   scheduler_cooldown: 20
 
-# ============================================================================
-# Trainer Configuration
-# ============================================================================
-
 trainer:
   _target_: sam3.train.trainer.Trainer
+  env_variables:
+    SAM3_DDP_FORCE_OUTPUTS_IN_LOSS: "1"
   skip_saving_ckpts: false
   empty_gpu_mem_cache_after_eval: True
   skip_first_val: True
@@ -158,7 +163,7 @@ trainer:
 
   distributed:
     backend: nccl
-    find_unused_parameters: False
+    find_unused_parameters: True
     gradient_as_bucket_view: True
 
   loss:
@@ -171,7 +176,6 @@ trainer:
       _target_: sam3.train.data.torch_dataset.TorchDataset
       dataset:
         _target_: sam3.train.data.sam3_image_dataset.Sam3ImageDataset
-        limit_ids: null
         transforms: ${ultrasound_train.train_transforms}
         load_segmentation: ${scratch.enable_segmentation}
         max_ann_per_img: 500000
@@ -181,11 +185,12 @@ trainer:
         training: true
         use_caching: False
         img_folder: ${paths.dataset_root}/pork
-        ann_file: ${paths.dataset_root}/annotations/train.json
+        # Recommend using annotations generated with --skip-empty to avoid "No find queries".
+        ann_file: ${paths.dataset_root}/annotations_nonempty/train.json
         coco_json_loader:
           _target_: sam3.train.data.coco_json_loaders.COCO_FROM_JSON
           prompts: ${ultrasound_train.prompts}
-          include_negatives: true
+          include_negatives: false
           _partial_: true
       shuffle: True
       batch_size: ${scratch.train_batch_size}
@@ -207,11 +212,11 @@ trainer:
         coco_json_loader:
           _target_: sam3.train.data.coco_json_loaders.COCO_FROM_JSON
           prompts: ${ultrasound_train.prompts}
-          include_negatives: true
+          include_negatives: false
           category_chunk_size: 1
           _partial_: true
         img_folder: ${paths.dataset_root}/pork
-        ann_file: ${paths.dataset_root}/annotations/val.json
+        ann_file: ${paths.dataset_root}/annotations_nonempty/val.json
         transforms: ${ultrasound_train.val_transforms}
         max_ann_per_img: 100000
         multiplier: 1
@@ -236,7 +241,6 @@ trainer:
     enable_segmentation: ${scratch.enable_segmentation}
     load_from_HF: false
     checkpoint_path: ${paths.sam3_ckpt_path}
-    # "freeze encoder + only train detector"
     freeze_vision_backbone: true
     freeze_language_backbone: true
 
@@ -249,16 +253,6 @@ trainer:
       _target_: sam3.train.optim.optimizer.GradientClipper
       max_norm: 0.1
       norm_type: 2
-
-    param_group_modifiers:
-      - _target_: sam3.train.optim.optimizer.layer_decay_param_modifier
-        _partial_: True
-        layer_decay_value: ${scratch.lrd_vision_backbone}
-        apply_to: 'backbone.vision_backbone.trunk'
-        overrides:
-          - pattern: '*pos_embed*'
-            value: 1.0
-
     options:
       lr:
         - scheduler:
@@ -267,33 +261,10 @@ trainer:
             timescale: ${scratch.scheduler_timescale}
             warmup_steps: ${scratch.scheduler_warmup}
             cooldown_steps: ${scratch.scheduler_cooldown}
-        - scheduler:
-            _target_: sam3.train.optim.schedulers.InverseSquareRootParamScheduler
-            base_lr: ${scratch.lr_vision_backbone}
-            timescale: ${scratch.scheduler_timescale}
-            warmup_steps: ${scratch.scheduler_warmup}
-            cooldown_steps: ${scratch.scheduler_cooldown}
-          param_names:
-            - 'backbone.vision_backbone.*'
-        - scheduler:
-            _target_: sam3.train.optim.schedulers.InverseSquareRootParamScheduler
-            base_lr: ${scratch.lr_language_backbone}
-            timescale: ${scratch.scheduler_timescale}
-            warmup_steps: ${scratch.scheduler_warmup}
-            cooldown_steps: ${scratch.scheduler_cooldown}
-          param_names:
-            - 'backbone.language_backbone.*'
-
       weight_decay:
         - scheduler:
             _target_: fvcore.common.param_scheduler.ConstantParamScheduler
             value: ${scratch.wd}
-        - scheduler:
-            _target_: fvcore.common.param_scheduler.ConstantParamScheduler
-            value: 0.0
-          param_names:
-            - '*bias*'
-          module_cls_names: ['torch.nn.LayerNorm']
 
   checkpoint:
     save_dir: ${launcher.experiment_log_dir}/checkpoints
@@ -312,10 +283,6 @@ trainer:
     log_dir: ${launcher.experiment_log_dir}/logs
     log_freq: 10
 
-# ============================================================================
-# Launcher and Submitit Configuration
-# ============================================================================
-
 launcher:
   num_nodes: 1
   gpus_per_node: 1
@@ -331,3 +298,4 @@ submitit:
   cpus_per_task: 10
   port_range: [10000, 65000]
   constraint: null
+
