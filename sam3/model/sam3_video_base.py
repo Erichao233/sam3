@@ -33,6 +33,105 @@ class MaskletConfirmationStatus(Enum):
 
 
 class Sam3VideoBase(nn.Module):
+    @staticmethod
+    def _cosine_sim_1d(a: Tensor, b: Tensor) -> float:
+        a = a.reshape(-1).float()
+        b = b.reshape(-1).float()
+        denom = (a.norm() * b.norm()).clamp_min(1e-12)
+        return float((a.dot(b) / denom).clamp(-1.0, 1.0).item())
+
+    def _maybe_attach_spme_signals(
+        self,
+        sam3_image_out: Dict[str, Tensor],
+        det_out: Dict[str, Tensor],
+        feature_cache: Dict,
+        frame_idx: int,
+    ) -> None:
+        """
+        Attach small per-frame SPME signals to `det_out` (single-prompt use cases):
+        - `spme_query_cos`: cosine similarity between current top-1 query and an anchor query
+        - `spme_det_score_raw`: raw top-1 detection probability (before NMS)
+        - `spme_query_vec`: the current top-1 query vector (for optional feature fusion)
+
+        Notes:
+        - Anchor selection defaults to the first frame; set `SAM3_SPME_ANCHOR_DET_THR>0` to
+          delay anchor initialization until the detector is confident enough.
+        """
+        if (
+            os.getenv("SAM3_SPME_WRITE_GATE", "0") != "1"
+            and os.getenv("SAM3_SPME_DEBUG_SIGNALS", "0") != "1"
+            and os.getenv("SAM3_SPME_FUSION", "0") != "1"
+        ):
+            return
+
+        score_raw = sam3_image_out.get("query_top1_score_raw", None)
+        if isinstance(score_raw, torch.Tensor) and score_raw.numel() > 0:
+            det_out["spme_det_score_raw"] = float(
+                score_raw.detach().float().flatten()[0].clamp(0.0, 1.0).item()
+            )
+            det_out["spme_det_frame_idx"] = int(frame_idx)
+
+        q = sam3_image_out.get("query_top1_raw", None)
+        if isinstance(q, torch.Tensor) and q.numel() > 0:
+            q0 = q[0] if q.ndim == 2 else q
+            q0 = q0.detach()
+            det_out["spme_query_vec"] = q0
+            anchor = feature_cache.get("spme_query_anchor", None)
+            if not isinstance(anchor, torch.Tensor) or anchor.numel() == 0:
+                anchor_det_thr = float(os.getenv("SAM3_SPME_ANCHOR_DET_THR", "0.0"))
+                det_score_f = det_out.get("spme_det_score_raw", None)
+                if det_score_f is not None and anchor_det_thr > 0.0 and float(det_score_f) < anchor_det_thr:
+                    # Delay anchor selection until the detector is confident enough.
+                    return
+                feature_cache["spme_query_anchor"] = q0
+                det_out["spme_query_cos"] = 1.0
+            else:
+                anchor = anchor.to(device=q0.device)
+                det_out["spme_query_cos"] = self._cosine_sim_1d(anchor, q0)
+
+    def _compute_spme_write_gate(self, det_out: Dict[str, Any], frame_idx: int) -> float | None:
+        """
+        Compute a scalar gate in [0, 1] controlling memory write strength.
+
+        Env vars:
+        - `SAM3_SPME_WRITE_GATE=1` enables gating.
+        - `SAM3_SPME_WRITE_GATE_MODE` in {hard, soft}. Default: hard.
+        - `SAM3_SPME_DET_THR` (float). Default: 0.0. If >0, only apply gate when det_score_raw >= det_thr.
+        - `SAM3_SPME_QCOS_THR` (float). Default: 0.8.
+        - `SAM3_SPME_USE_DET_SCORE` in {0,1}. Default: 1 (only used in soft mode).
+        """
+        if os.getenv("SAM3_SPME_WRITE_GATE", "0") != "1":
+            return None
+
+        mode = os.getenv("SAM3_SPME_WRITE_GATE_MODE", "hard").strip().lower()
+        det_thr = float(os.getenv("SAM3_SPME_DET_THR", "0.0"))
+        q_thr = float(os.getenv("SAM3_SPME_QCOS_THR", "0.8"))
+        qcos = det_out.get("spme_query_cos", None)
+        if qcos is None:
+            return 1.0  # safe fallback
+        qcos_f = float(qcos)
+
+        det_score = det_out.get("spme_det_score_raw", None)
+        det_score_f = float(det_score) if det_score is not None else None
+        if det_score_f is not None and det_thr > 0.0 and det_score_f < det_thr:
+            return 1.0
+
+        if mode == "hard":
+            gate = 1.0 if qcos_f >= q_thr else 0.0
+        else:
+            denom = max(1e-6, 1.0 - q_thr)
+            gate = max(0.0, min(1.0, (qcos_f - q_thr) / denom))
+            if os.getenv("SAM3_SPME_USE_DET_SCORE", "1") == "1":
+                if det_score_f is not None:
+                    gate *= max(0.0, min(1.0, det_score_f))
+
+        if os.getenv("SAM3_SPME_DEBUG_SIGNALS", "0") == "1" and self.rank == 0:
+            logger.info(
+                f"[SPME] frame={frame_idx} gate={gate:.3f} qcos={qcos_f:.3f} "
+                f"det={det_score_f}"
+            )
+        return float(gate)
+
     def __init__(
         self,
         detector: nn.Module,
@@ -375,6 +474,7 @@ class Sam3VideoBase(nn.Module):
             "mask": pred_masks[pos_pred_idx[0], pos_pred_idx[1]],
             "scores": pred_probs[pos_pred_idx[0], pos_pred_idx[1]],
         }
+        self._maybe_attach_spme_signals(sam3_image_out, det_out, feature_cache, frame_idx)
 
         # Step 3: build SAM2 backbone features and store them in `feature_cache`
         backbone_cache = {}
@@ -757,6 +857,10 @@ class Sam3VideoBase(nn.Module):
                 frame_idx,
                 tracker_metadata=tracker_metadata_prev,
                 low_res_masks=tracker_low_res_masks_global,
+                spme_write_gate=self._compute_spme_write_gate(det_out, frame_idx),
+                spme_query_vec=det_out.get("spme_query_vec", None),
+                spme_det_score_raw=det_out.get("spme_det_score_raw", None),
+                track_in_reverse=reverse,
             )
 
         # Step 4: update the SAM2 metadata based on the update plan
@@ -1440,12 +1544,48 @@ class Sam3VideoBase(nn.Module):
         frame_idx: int,
         tracker_metadata: Dict[str, Any],
         low_res_masks: Tensor,
+        spme_write_gate: float | None = None,
+        spme_query_vec: Tensor | None = None,
+        spme_det_score_raw: float | None = None,
+        track_in_reverse: bool = False,
     ):
         """
         Run Sam2 memory encoder, enforcing non-overlapping constraints globally.
         """
         if len(tracker_inference_states) == 0:
             return
+        gate = None
+        if spme_write_gate is not None:
+            gate = max(0.0, min(1.0, float(spme_write_gate)))
+        apply_mode = os.getenv("SAM3_SPME_WRITE_GATE_APPLY", "blend_mem").strip().lower()
+
+        # Optional: Semantic query -> memory feature fusion (SPME-F).
+        #
+        # This is a lightweight, training-free "reinforcement" that injects a projected
+        # detector query vector into the memory features before storing them.
+        #
+        # Env vars:
+        # - `SAM3_SPME_FUSION=1` enables fusion.
+        # - `SAM3_SPME_FUSION_ALPHA` (float): base scale for residual injection. Default: 0.0 (off).
+        # - `SAM3_SPME_FUSION_DET_THR` (float): only inject when det_score_raw >= thr. Default: 0.0.
+        fusion_scale: float | None = None
+        if os.getenv("SAM3_SPME_FUSION", "0") == "1":
+            base_alpha = float(os.getenv("SAM3_SPME_FUSION_ALPHA", "0.0"))
+            det_thr = float(os.getenv("SAM3_SPME_FUSION_DET_THR", "0.0"))
+            if (
+                base_alpha > 0.0
+                and isinstance(spme_query_vec, torch.Tensor)
+                and spme_query_vec.numel() > 0
+                and spme_det_score_raw is not None
+            ):
+                det_score_f = float(spme_det_score_raw)
+                if det_score_f >= det_thr:
+                    gate_f = gate if gate is not None else 1.0
+                    fusion_scale = float(
+                        max(0.0, min(1.0, base_alpha * max(0.0, min(1.0, det_score_f)) * gate_f))
+                    )
+                    if fusion_scale <= 0.0:
+                        fusion_scale = None
         # Avoid an extra interpolation step by directly interpolating to `interpol_size`
         high_res_H, high_res_W = (
             self.tracker.maskmem_backbone.mask_downsampler.interpol_size
@@ -1462,10 +1602,18 @@ class Sam3VideoBase(nn.Module):
             high_res_masks = self.tracker._suppress_object_pw_area_shrinkage(
                 high_res_masks
             )
+        if gate is not None and gate < 1.0 and apply_mode in {"mask_logits", "masklogits"}:
+            empty_logit = -10.0
+            high_res_masks = high_res_masks * gate + empty_logit * (1.0 - gate)
         # Instead of gathering the predicted object scores, we use mask areas as a proxy.
         object_score_logits = torch.where(
             (high_res_masks > 0).any(dim=(-1, -2)), 10.0, -10.0
         )
+        if gate is not None and gate < 1.0 and apply_mode in {"mask_logits", "masklogits"}:
+            object_score_logits = object_score_logits.new_full(
+                object_score_logits.shape,
+                10.0 * (2.0 * gate - 1.0),
+            )
 
         # Run the memory encoder on local slices for each GPU
         start_idx_gpu = sum(tracker_metadata["num_obj_per_gpu"][: self.rank])
@@ -1492,6 +1640,56 @@ class Sam3VideoBase(nn.Module):
                 is_mask_from_pts=False,
             )
             local_maskmem_features, local_maskmem_pos_enc = encoded_mem
+            if gate is not None and gate < 1.0 and apply_mode in {"blend_mem", "blend", "ema"}:
+                prev_frame_idx = frame_idx + 1 if track_in_reverse else frame_idx - 1
+                prev_out = None
+                if prev_frame_idx >= 0:
+                    prev_out = tracker_state["output_dict"]["non_cond_frame_outputs"].get(
+                        prev_frame_idx, None
+                    )
+                    if prev_out is None:
+                        prev_out = tracker_state["output_dict"]["cond_frame_outputs"].get(
+                            prev_frame_idx, None
+                        )
+                if isinstance(prev_out, dict):
+                    prev_feat = prev_out.get("maskmem_features", None)
+                    if (
+                        isinstance(prev_feat, torch.Tensor)
+                        and prev_feat.shape == local_maskmem_features.shape
+                    ):
+                        prev_feat = prev_feat.to(
+                            device=local_maskmem_features.device,
+                            dtype=local_maskmem_features.dtype,
+                        )
+                        local_maskmem_features = (
+                            local_maskmem_features * gate + prev_feat * (1.0 - gate)
+                        )
+            if fusion_scale is not None:
+                qv = spme_query_vec.detach()
+                if qv.ndim > 1:
+                    qv = qv.reshape(-1)
+                qv = qv.to(device=local_maskmem_features.device, dtype=torch.float32)
+                qv = qv / qv.norm().clamp_min(1e-6)
+                qv = qv.view(1, -1)  # (1, D)
+                mem_dim = int(local_maskmem_features.shape[1])
+                if int(qv.shape[1]) == mem_dim:
+                    q_mem = qv
+                else:
+                    proj = getattr(self.tracker, "obj_ptr_tpos_proj", None)
+                    if isinstance(proj, nn.Module):
+                        q_mem = proj(qv)
+                    else:
+                        q_mem = qv[:, :mem_dim]
+                        if int(q_mem.shape[1]) < mem_dim:
+                            q_mem = F.pad(q_mem, (0, mem_dim - int(q_mem.shape[1])))
+                q_mem = q_mem.to(
+                    device=local_maskmem_features.device,
+                    dtype=local_maskmem_features.dtype,
+                )
+                resid = q_mem.view(1, mem_dim, 1, 1)
+                local_maskmem_features = local_maskmem_features + resid * float(
+                    fusion_scale
+                )
             # Store encoded memories in the local inference state
             output_dict = tracker_state["output_dict"]
             for storage_key in ["cond_frame_outputs", "non_cond_frame_outputs"]:
@@ -1503,6 +1701,33 @@ class Sam3VideoBase(nn.Module):
                 output_dict[storage_key][frame_idx]["maskmem_pos_enc"] = [
                     pos for pos in local_maskmem_pos_enc
                 ]
+                if gate is not None and gate < 1.0 and apply_mode in {"blend_mem", "blend", "ema"}:
+                    prev_frame_idx = frame_idx + 1 if track_in_reverse else frame_idx - 1
+                    prev_out = None
+                    if prev_frame_idx >= 0:
+                        prev_out = output_dict[storage_key].get(prev_frame_idx, None)
+                    if prev_out is None and prev_frame_idx >= 0:
+                        other_key = (
+                            "cond_frame_outputs"
+                            if storage_key == "non_cond_frame_outputs"
+                            else "non_cond_frame_outputs"
+                        )
+                        prev_out = output_dict[other_key].get(prev_frame_idx, None)
+                    if isinstance(prev_out, dict):
+                        prev_ptr = prev_out.get("obj_ptr", None)
+                        curr_ptr = output_dict[storage_key][frame_idx].get("obj_ptr", None)
+                        if (
+                            isinstance(prev_ptr, torch.Tensor)
+                            and isinstance(curr_ptr, torch.Tensor)
+                            and prev_ptr.shape == curr_ptr.shape
+                        ):
+                            prev_ptr = prev_ptr.to(
+                                device=curr_ptr.device,
+                                dtype=curr_ptr.dtype,
+                            )
+                            output_dict[storage_key][frame_idx]["obj_ptr"] = (
+                                curr_ptr * gate + prev_ptr * (1.0 - gate)
+                            )
                 # for batched inference state, we also need to add per-object
                 # memory slides to support instance interactivity
                 self.tracker._add_output_per_object(

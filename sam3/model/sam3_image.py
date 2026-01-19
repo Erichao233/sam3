@@ -813,6 +813,21 @@ class Sam3ImageOnVideoMultiGPU(Sam3Image):
                 find_target=None,
                 geometric_prompt=geometric_prompt,
             )
+
+        # Keep a compact query embedding for analysis/debugging.
+        # We take the top-1 query by *raw* detection probability (before NMS suppression),
+        # which is useful even when `nms_prob_thresh` would remove all detections.
+        queries = out_local.get("queries", None)
+        if queries is not None and "pred_logits" in out_local:
+            with torch.no_grad():
+                pred_probs_raw = out_local["pred_logits"].squeeze(-1).sigmoid()  # (P, Q)
+                top_prob_raw, top_idx = pred_probs_raw.max(dim=1)  # (P,)
+                prompt_idx = torch.arange(
+                    pred_probs_raw.size(0), device=top_idx.device
+                )
+                out_local["query_top1_raw"] = queries[prompt_idx, top_idx]  # (P, D)
+                out_local["query_top1_score_raw"] = top_prob_raw  # (P,)
+                out_local["query_top1_idx_raw"] = top_idx  # (P,)
         if run_nms:
             with torch.profiler.record_function("nms_masks"):
                 # run NMS as a post-processing step on top of the detection outputs
@@ -843,6 +858,13 @@ class Sam3ImageOnVideoMultiGPU(Sam3Image):
             # vision_pos_enc is the same on all frames, so no need to all-gather them
             vision_pos_enc = feats["vision_pos_enc"]
 
+        # Keep presence logits for analysis/debugging (small tensor; useful for Phase-0 plots).
+        # Note: `presence_logit_dec` exists when the transformer is built with a presence token.
+        presence_logit_dec = out_local.get("presence_logit_dec", None)
+        query_top1_raw = out_local.get("query_top1_raw", None)
+        query_top1_score_raw = out_local.get("query_top1_score_raw", None)
+        query_top1_idx_raw = out_local.get("query_top1_idx_raw", None)
+
         # trim the detector output to only include the necessary keys
         out_local = {
             "pred_logits": out_local["pred_logits"],
@@ -850,6 +872,14 @@ class Sam3ImageOnVideoMultiGPU(Sam3Image):
             "pred_boxes_xyxy": out_local["pred_boxes_xyxy"],
             "pred_masks": out_local["pred_masks"],
         }
+        if presence_logit_dec is not None:
+            out_local["presence_logit_dec"] = presence_logit_dec
+        if query_top1_raw is not None:
+            out_local["query_top1_raw"] = query_top1_raw
+        if query_top1_score_raw is not None:
+            out_local["query_top1_score_raw"] = query_top1_score_raw
+        if query_top1_idx_raw is not None:
+            out_local["query_top1_idx_raw"] = query_top1_idx_raw
 
         # gather the results: after this step, each GPU will receive detector outputs on
         # all frames in the chunk and store them in `multigpu_buffer`
