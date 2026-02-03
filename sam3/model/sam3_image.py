@@ -820,7 +820,8 @@ class Sam3ImageOnVideoMultiGPU(Sam3Image):
         queries = out_local.get("queries", None)
         if queries is not None and "pred_logits" in out_local:
             with torch.no_grad():
-                pred_probs_raw = out_local["pred_logits"].squeeze(-1).sigmoid()  # (P, Q)
+                # Cast to float32 before sigmoid to reduce underflow in AMP/FP16.
+                pred_probs_raw = out_local["pred_logits"].float().squeeze(-1).sigmoid()  # (P, Q)
                 top_prob_raw, top_idx = pred_probs_raw.max(dim=1)  # (P,)
                 prompt_idx = torch.arange(
                     pred_probs_raw.size(0), device=top_idx.device
@@ -828,11 +829,23 @@ class Sam3ImageOnVideoMultiGPU(Sam3Image):
                 out_local["query_top1_raw"] = queries[prompt_idx, top_idx]  # (P, D)
                 out_local["query_top1_score_raw"] = top_prob_raw  # (P,)
                 out_local["query_top1_idx_raw"] = top_idx  # (P,)
+                # Optional: keep Top-K raw queries (small tensor; useful for multi-query pooling).
+                # Controlled by env var so existing runs don't pay extra overhead unless needed.
+                try:
+                    topk_k = int(os.getenv("SAM3_SPME_QUERY_TOPK", "0"))
+                except Exception:
+                    topk_k = 0
+                if topk_k and topk_k > 1:
+                    k = max(1, min(int(topk_k), int(pred_probs_raw.size(1))))
+                    topk_prob_raw, topk_idx = pred_probs_raw.topk(k=k, dim=1)  # (P, K)
+                    out_local["query_topk_raw"] = queries[prompt_idx[:, None], topk_idx]  # (P, K, D)
+                    out_local["query_topk_score_raw"] = topk_prob_raw  # (P, K)
+                    out_local["query_topk_idx_raw"] = topk_idx  # (P, K)
         if run_nms:
             with torch.profiler.record_function("nms_masks"):
                 # run NMS as a post-processing step on top of the detection outputs
                 assert nms_prob_thresh is not None and nms_iou_thresh is not None
-                pred_probs = out_local["pred_logits"].squeeze(-1).sigmoid()
+                pred_probs = out_local["pred_logits"].float().squeeze(-1).sigmoid()
                 pred_masks = out_local["pred_masks"]
                 # loop over text prompts (not an overhead for demo where there's only 1 prompt)
                 for prompt_idx in range(pred_probs.size(0)):
@@ -864,6 +877,10 @@ class Sam3ImageOnVideoMultiGPU(Sam3Image):
         query_top1_raw = out_local.get("query_top1_raw", None)
         query_top1_score_raw = out_local.get("query_top1_score_raw", None)
         query_top1_idx_raw = out_local.get("query_top1_idx_raw", None)
+        query_topk_raw = out_local.get("query_topk_raw", None)
+        query_topk_score_raw = out_local.get("query_topk_score_raw", None)
+        query_topk_idx_raw = out_local.get("query_topk_idx_raw", None)
+        queries = out_local.get("queries", None)
 
         # trim the detector output to only include the necessary keys
         out_local = {
@@ -880,6 +897,18 @@ class Sam3ImageOnVideoMultiGPU(Sam3Image):
             out_local["query_top1_score_raw"] = query_top1_score_raw
         if query_top1_idx_raw is not None:
             out_local["query_top1_idx_raw"] = query_top1_idx_raw
+        if query_topk_raw is not None:
+            out_local["query_topk_raw"] = query_topk_raw
+        if query_topk_score_raw is not None:
+            out_local["query_topk_score_raw"] = query_topk_score_raw
+        if query_topk_idx_raw is not None:
+            out_local["query_topk_idx_raw"] = query_topk_idx_raw
+        # Optional: keep full per-query embeddings so downstream code can build per-object
+        # semantic pointers by matching detection masks to tracker masks. This is off by
+        # default to avoid extra all-gather overhead in the general case.
+        if os.getenv("SAM3_SPME_KEEP_QUERIES", "0") == "1":
+            if queries is not None:
+                out_local["queries"] = queries
 
         # gather the results: after this step, each GPU will receive detector outputs on
         # all frames in the chunk and store them in `multigpu_buffer`

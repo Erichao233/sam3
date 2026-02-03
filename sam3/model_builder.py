@@ -3,8 +3,6 @@
 import os
 from typing import Optional
 
-import pkg_resources
-
 import torch
 import torch.nn as nn
 from huggingface_hub import hf_hub_download
@@ -55,6 +53,21 @@ def _setup_tf32() -> None:
 
 
 _setup_tf32()
+
+
+def _default_bpe_path() -> str:
+    """Return the default tokenizer vocab path without relying on deprecated pkg_resources."""
+    try:
+        from importlib.resources import files  # py>=3.9
+
+        return str(files("sam3").joinpath("assets/bpe_simple_vocab_16e6.txt.gz"))
+    except Exception:
+        # Fallback for older environments; avoids importing pkg_resources unless needed.
+        import pkg_resources  # type: ignore
+
+        return pkg_resources.resource_filename(
+            "sam3", "assets/bpe_simple_vocab_16e6.txt.gz"
+        )
 
 
 def _create_position_encoding(precompute_resolution=None):
@@ -584,9 +597,7 @@ def build_sam3_image_model(
         A SAM3 image model
     """
     if bpe_path is None:
-        bpe_path = pkg_resources.resource_filename(
-            "sam3", "assets/bpe_simple_vocab_16e6.txt.gz"
-        )
+        bpe_path = _default_bpe_path()
 
     # Create visual components
     compile_mode = "default" if compile else None
@@ -681,9 +692,7 @@ def build_sam3_video_model(
         Sam3VideoInferenceWithInstanceInteractivity: The instantiated dense tracking model
     """
     if bpe_path is None:
-        bpe_path = pkg_resources.resource_filename(
-            "sam3", "assets/bpe_simple_vocab_16e6.txt.gz"
-        )
+        bpe_path = _default_bpe_path()
 
     # Build Tracker module
     tracker = build_tracker(apply_temporal_disambiguation=apply_temporal_disambiguation)
@@ -779,6 +788,30 @@ def build_sam3_video_model(
             compile_model=compile,
         )
 
+    # ------------------------------------------------------------------
+    # Optional env override: recondition frequency (ablation-friendly)
+    #
+    # SAM3's default uses periodic "recondition" (e.g., every 16 frames) where
+    # high-overlap detector masks can overwrite tracker outputs to reduce drift.
+    # For our SPME experiments, we often want to isolate this heuristic from the
+    # learned gate/fusion effects, so allow overriding it without disabling the
+    # rest of temporal disambiguation.
+    #
+    # - Set `SAM3_DISABLE_RECONDITION=1` to force OFF (0).
+    # - Or set `SAM3_RECONDITION_EVERY_NTH_FRAME=N` to override.
+    # ------------------------------------------------------------------
+    disable_recond = os.getenv("SAM3_DISABLE_RECONDITION", "").strip().lower()
+    recond_every = os.getenv("SAM3_RECONDITION_EVERY_NTH_FRAME", "").strip()
+    if disable_recond not in {"", "0", "false", "no"}:
+        model.recondition_every_nth_frame = 0
+    elif recond_every:
+        try:
+            model.recondition_every_nth_frame = int(recond_every)
+        except ValueError as e:
+            raise ValueError(
+                f"Invalid SAM3_RECONDITION_EVERY_NTH_FRAME={recond_every!r} (must be int)"
+            ) from e
+
     # Load checkpoint if provided
     if load_from_HF and checkpoint_path is None:
         checkpoint_path = download_ckpt_from_hf()
@@ -788,11 +821,36 @@ def build_sam3_video_model(
         if "model" in ckpt and isinstance(ckpt["model"], dict):
             ckpt = ckpt["model"]
 
-        missing_keys, unexpected_keys = model.load_state_dict(
-            ckpt, strict=strict_state_dict_loading
-        )
+        # We sometimes add small research modules (e.g., SPME-*) that are not present
+        # in the released SAM3 checkpoints. To keep strict loading useful while still
+        # allowing these optional additions, we always load with strict=False and then
+        # validate missing/unexpected keys explicitly.
+        missing_keys, unexpected_keys = model.load_state_dict(ckpt, strict=False)
+
+        if strict_state_dict_loading:
+            allowed_missing_prefixes = ("spme_",)
+            missing_disallowed = [
+                k for k in missing_keys if not k.startswith(allowed_missing_prefixes)
+            ]
+            if missing_disallowed or unexpected_keys:
+                raise RuntimeError(
+                    "Strict checkpoint loading failed.\n"
+                    f"Missing keys (disallowed): {missing_disallowed}\n"
+                    f"Unexpected keys: {unexpected_keys}\n"
+                    f"All missing keys: {missing_keys}\n"
+                )
+
         if missing_keys:
-            print(f"Missing keys: {missing_keys}")
+            allowed_missing_prefixes = ("spme_",)
+            missing_allowed = [k for k in missing_keys if k.startswith(allowed_missing_prefixes)]
+            missing_disallowed = [
+                k for k in missing_keys if not k.startswith(allowed_missing_prefixes)
+            ]
+            if missing_disallowed:
+                print(f"Missing keys: {missing_disallowed}")
+            else:
+                # Common case: optional research modules (SPME-*) not present in released checkpoints.
+                print(f"Missing optional keys (expected): {missing_allowed}")
         if unexpected_keys:
             print(f"Unexpected keys: {unexpected_keys}")
 

@@ -57,6 +57,7 @@ def convert_folder(
     split_name: str,
     seq_ids: set[int] | None,
     skip_empty_images: bool,
+    category_name_mode: str,
 ) -> dict:
     image_dir = dataset_root / split_name / "image"
     label_dir = dataset_root / split_name / "label"
@@ -65,16 +66,28 @@ def convert_folder(
     if not label_dir.exists():
         raise FileNotFoundError(f"Missing: {label_dir}")
 
+    if category_name_mode == "generic":
+        categories = [
+            {"id": int(k), "name": f"instrument_{int(k)}"} for k in INSTRUMENT_CLASSES.keys()
+        ]
+    else:
+        categories = [{"id": int(k), "name": v} for k, v in INSTRUMENT_CLASSES.items()]
+
     coco = {
         "images": [],
         "annotations": [],
-        "categories": [{"id": int(k), "name": v} for k, v in INSTRUMENT_CLASSES.items()],
+        "categories": categories,
     }
 
     image_id = 1
     ann_id = 1
 
-    img_paths = sorted(image_dir.glob("*.bmp"))
+    allowed_exts = {".bmp", ".png", ".jpg", ".jpeg"}
+    img_paths = sorted(
+        p
+        for p in image_dir.iterdir()
+        if p.is_file() and p.suffix.lower() in allowed_exts
+    )
     if not img_paths:
         raise RuntimeError(f"No images found under: {image_dir}")
 
@@ -160,6 +173,13 @@ def main():
         action="store_true",
         help="Drop frames with no instrument pixels at all.",
     )
+    ap.add_argument(
+        "--category-name-mode",
+        type=str,
+        default="official",
+        choices=["official", "generic"],
+        help="COCO category names. 'generic' avoids instrument-name strings (keeps ids unchanged).",
+    )
     args = ap.parse_args()
 
     dataset_root = Path(args.dataset_root).expanduser().resolve()
@@ -171,12 +191,14 @@ def main():
         split_name="train",
         seq_ids=set(args.train_seqs) if args.train_seqs else None,
         skip_empty_images=args.skip_empty_images,
+        category_name_mode=str(args.category_name_mode),
     )
     val_coco = convert_folder(
         dataset_root=dataset_root,
         split_name="train",
         seq_ids=set(args.val_seqs) if args.val_seqs else None,
         skip_empty_images=args.skip_empty_images,
+        category_name_mode=str(args.category_name_mode),
     )
 
     train_path = out_dir / "train.json"
@@ -196,4 +218,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

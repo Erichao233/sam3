@@ -28,8 +28,28 @@ export SAM3_DISABLE_TRITON=1
 
 REPO=/home2020/home/icube/kunyuan/SurgBench/SAM/sam3
 DATA=/home2020/home/icube/kunyuan/SurgBench/surgicaltool/endovis2017
+ENDOVIS_SRC="${ENDOVIS_SRC:-/home2020/home/icube/kunyuan/SurgBench/surgicaltool/Endovis2017}"
+PREPARE_DATA="${PREPARE_DATA:-auto}"  # 0 | 1 | auto
+CAMERA="${CAMERA:-left}"  # left | right
 
 cd "$REPO"
+
+if [[ "$PREPARE_DATA" == "1" || ( "$PREPARE_DATA" == "auto" && ! -d "$DATA/train/image" ) ]]; then
+  echo "=== [0/1] Prepare official EndoVis2017 -> canonical layout ==="
+  if [[ ! -d "$ENDOVIS_SRC" ]]; then
+    echo "[error] ENDOVIS_SRC not found: $ENDOVIS_SRC"
+    exit 1
+  fi
+  python -u scripts/prepare_endovis2017_official.py \
+    --src-root "$ENDOVIS_SRC" \
+    --out-root "$DATA" \
+    --camera "$CAMERA" \
+    --overwrite
+fi
+if [[ ! -d "$DATA/train/image" ]]; then
+  echo "[error] Missing processed dataset folder: $DATA/train/image"
+  exit 1
+fi
 
 echo "=== Resume EndoVis finetuning from checkpoint_5 ==="
 echo "Config: max_data_epochs=20, resume_from=checkpoint_5.pt"

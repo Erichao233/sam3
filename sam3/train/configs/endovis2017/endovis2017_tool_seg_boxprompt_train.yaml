@@ -6,6 +6,11 @@ defaults:
 # EndoVis2017 finetuning (image-level) to adapt SAM3 detector/seg head.
 # Train on EndoVis2017 train sequences 1..7, validate on train seq 8.
 #
+# IMPORTANT (EndoVis prompt strategy):
+# - Do NOT rely on instrument-name text (e.g., "bipolar forceps") for EndoVis.
+# - We convert all training queries to **visual box prompts** and overwrite query_text to "visual",
+#   so the finetune is effectively *language-free* (box-conditioned).
+#
 # Before training, generate COCO JSONs:
 #   python scripts/endovis2017_to_coco.py \
 #     --dataset-root /path/to/endovis2017 \
@@ -23,13 +28,13 @@ paths:
 endovis_train:
   prompts: >-
     [
-      {"id": 1, "name": "bipolar forceps"},
-      {"id": 2, "name": "prograsp forceps"},
-      {"id": 3, "name": "large needle driver"},
-      {"id": 4, "name": "vessel sealer"},
-      {"id": 5, "name": "grasping retractor"},
-      {"id": 6, "name": "monopolar curved scissors"},
-      {"id": 7, "name": "surgical instrument"}
+      {"id": 1, "name": "visual"},
+      {"id": 2, "name": "visual"},
+      {"id": 3, "name": "visual"},
+      {"id": 4, "name": "visual"},
+      {"id": 5, "name": "visual"},
+      {"id": 6, "name": "visual"},
+      {"id": 7, "name": "visual"}
     ]
 
   train_transforms:
@@ -41,7 +46,7 @@ endovis_train:
         # Turn text queries into box-prompted queries using GT boxes (then we add noise).
         - _target_: sam3.train.transforms.filter_query_transforms.TextQueryToVisual
           probability: 1.0
-          keep_text_queries: true
+          keep_text_queries: false
         - _target_: sam3.train.transforms.point_sampling.RandomizeInputBbox
           box_noise_std: 0.1
           box_noise_max: 20
@@ -73,7 +78,7 @@ endovis_train:
       transforms:
         - _target_: sam3.train.transforms.filter_query_transforms.TextQueryToVisual
           probability: 1.0
-          keep_text_queries: true
+          keep_text_queries: false
         - _target_: sam3.train.transforms.segmentation.DecodeRle
         - _target_: sam3.train.transforms.basic_for_api.RandomResizeAPI
           sizes: ${scratch.resolution}
@@ -168,7 +173,8 @@ scratch:
   lr_scale: 0.1
   lr_transformer: ${times:8e-4,${scratch.lr_scale}}
   lr_vision_backbone: ${times:2.5e-4,${scratch.lr_scale}}
-  lr_language_backbone: ${times:5e-5,${scratch.lr_scale}}
+  # Language is unused in this setting (query_text is overwritten to "visual").
+  lr_language_backbone: 0.0
   lrd_vision_backbone: 0.9
   wd: 0.1
   scheduler_timescale: 20
