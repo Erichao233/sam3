@@ -35,6 +35,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from sam3.model_builder import build_sam3_video_model
+from sam3.model.sam3_video_inference import Sam3VideoInference
 
 
 # ============================================================================
@@ -183,6 +184,8 @@ def compute_fused_metrics(
     - challenge_iou: average IoU over (frame, class) pairs where GT class is present
     - per_class_iou_present: mean IoU over GT-present frames for each class
     - mean_class_iou_present: mean over classes of per_class_iou_present (only classes that appear)
+    - per_class_iou: IoU over the whole sequence for each class (penalizes false positives on GT-absent frames)
+    - mean_class_iou: mean over classes of per_class_iou (paper-style mcIoU)
     - binary_iou: IoU of foreground (instrument vs background)
     """
     assert len(gt_labels) == len(fused_labels)
@@ -191,6 +194,10 @@ def compute_fused_metrics(
     # Per-class accumulation (GT-present frames only)
     per_class_ious: dict[int, list[float]] = {int(cid): [] for cid in class_ids}
     all_present_ious: list[float] = []
+
+    # Per-class intersection/union over the whole sequence (mcIoU-style).
+    per_class_inter: dict[int, int] = {int(cid): 0 for cid in class_ids}
+    per_class_union: dict[int, int] = {int(cid): 0 for cid in class_ids}
 
     # Binary foreground IoU per frame
     fg_ious: list[float] = []
@@ -201,6 +208,14 @@ def compute_fused_metrics(
 
         # Binary (any instrument)
         fg_ious.append(compute_iou(pred > 0, gt > 0))
+
+        # Whole-sequence IoU accumulation (intersection/union sums).
+        for cid in class_ids:
+            cid_i = int(cid)
+            gt_c = gt == cid_i
+            pred_c = pred == cid_i
+            per_class_inter[cid_i] += int(np.logical_and(pred_c, gt_c).sum())
+            per_class_union[cid_i] += int(np.logical_or(pred_c, gt_c).sum())
 
         present = [int(c) for c in np.unique(gt) if int(c) in set(class_ids) and int(c) > 0]
         for cid in present:
@@ -214,11 +229,23 @@ def compute_fused_metrics(
     }
     present_class_means = [v for v in per_class_iou_present.values() if v is not None]
 
+    per_class_iou = {
+        int(cid): (
+            float(per_class_inter[int(cid)]) / float(per_class_union[int(cid)])
+            if int(per_class_union[int(cid)]) > 0
+            else None
+        )
+        for cid in class_ids
+    }
+    class_means = [v for v in per_class_iou.values() if v is not None]
+
     return {
         "num_frames": int(num_frames),
         "challenge_iou": float(np.mean(all_present_ious)) if all_present_ious else 0.0,
         "mean_class_iou_present": float(np.mean(present_class_means)) if present_class_means else 0.0,
         "per_class_iou_present": per_class_iou_present,
+        "mean_class_iou": float(np.mean(class_means)) if class_means else 0.0,
+        "per_class_iou": per_class_iou,
         "binary_iou": float(np.mean(fg_ious)) if fg_ious else 0.0,
     }
 
@@ -231,8 +258,22 @@ class FrameResult:
     iou: float
     dice: float
     det_score: Optional[float] = None
+    presence_prob: Optional[float] = None
     query_cos: Optional[float] = None
+    det_trk_iou: Optional[float] = None
     tracker_score: Optional[float] = None
+    fusion_scale_mem: Optional[float] = None
+    fusion_scale_obj: Optional[float] = None
+    gate_mem_scale_mean: Optional[float] = None
+    gate_mem_offset_mean_abs: Optional[float] = None
+    gate_decay: Optional[float] = None
+    gate_fusion: Optional[float] = None
+    reinit: Optional[float] = None
+    reid_best_sim: Optional[float] = None
+    reid_margin: Optional[float] = None
+    reid_accept: Optional[float] = None
+    reid_bank_size: Optional[float] = None
+    skip_write: Optional[float] = None
 
 
 @dataclass  
@@ -272,6 +313,8 @@ def run_sam3_tracking(
     init_min_area: int = 0,
     init_box_pad: int = 0,
     debug_init: bool = False,
+    propagation_mode: str = "vg",
+    fusion_weight_mode: str = "tracker_prob",
 ) -> tuple[list[FrameResult], dict[int, np.ndarray], dict[int, float]]:
     """
     Run SAM3 video tracking for a single class.
@@ -291,6 +334,13 @@ def run_sam3_tracking(
     init_prompt = str(init_prompt).strip().lower()
     if init_prompt not in {"box", "mask"}:
         raise ValueError(f"Unknown init_prompt={init_prompt!r}. Use 'box' or 'mask'.")
+
+    fusion_weight_mode = str(fusion_weight_mode).strip().lower()
+    if fusion_weight_mode not in {"tracker_prob", "det_prob", "eff_iou", "reliability"}:
+        raise ValueError(
+            f"Unknown fusion_weight_mode={fusion_weight_mode!r}. "
+            "Use one of: tracker_prob | det_prob | eff_iou | reliability."
+        )
     
     # Load all images (PIL) and masks
     images_pil: list[Image.Image] = []
@@ -336,6 +386,8 @@ def run_sam3_tracking(
                 dice=0.0,
             ))
         return results, {}, {}
+
+    spme_debug_by_local_frame: dict[int, dict[str, float]] = {}
 
     # Initialize inference state (use a list of PIL images to preserve the frame ordering)
     with torch.inference_mode():
@@ -485,12 +537,20 @@ def run_sam3_tracking(
                     out0_tracker_probs = out0.get(
                         "out_tracker_probs", np.zeros(len(out0_obj_ids), dtype=np.float32)
                     )
-                    if len(out0_tracker_probs) == len(out0_obj_ids):
-                        video_weights[int(init_frame_idx)] = float(out0_tracker_probs[int(match0[0])])
-                    elif len(out0_probs) == len(out0_obj_ids):
-                        video_weights[int(init_frame_idx)] = float(out0_probs[int(match0[0])])
+                    w_trk = (
+                        float(out0_tracker_probs[int(match0[0])])
+                        if len(out0_tracker_probs) == len(out0_obj_ids)
+                        else 0.0
+                    )
+                    w_det = (
+                        float(out0_probs[int(match0[0])])
+                        if len(out0_probs) == len(out0_obj_ids)
+                        else 0.0
+                    )
+                    if fusion_weight_mode == "det_prob":
+                        video_weights[int(init_frame_idx)] = w_det if w_det > 0.0 else w_trk
                     else:
-                        video_weights[int(init_frame_idx)] = 0.0
+                        video_weights[int(init_frame_idx)] = w_trk if w_trk > 0.0 else w_det
 
         # Propagate through video and store predicted mask for the chosen object id.
         # If init_frame_idx is not the first GT-present frame, run backward propagation too.
@@ -510,14 +570,26 @@ def run_sam3_tracking(
                 if len(match) > 0:
                     mi = int(match[0])
                     pred_mask = out_masks[mi].astype(bool)
-                    if len(out_tracker_probs) == len(out_obj_ids):
-                        weight = float(out_tracker_probs[mi])
-                    elif len(out_probs) == len(out_obj_ids):
-                        weight = float(out_probs[mi])
+                    w_trk = float(out_tracker_probs[mi]) if len(out_tracker_probs) == len(out_obj_ids) else 0.0
+                    w_det = float(out_probs[mi]) if len(out_probs) == len(out_obj_ids) else 0.0
+                    if fusion_weight_mode == "det_prob":
+                        weight = w_det if w_det > 0.0 else w_trk
+                    else:
+                        weight = w_trk if w_trk > 0.0 else w_det
             video_segments[int(out_frame_idx)] = pred_mask
             video_weights[int(out_frame_idx)] = weight
 
-        for out_frame_idx, out in model.propagate_in_video(
+        if str(propagation_mode).strip().lower() == "vg":
+            # IMPORTANT: This forces SAM3's detector+tracker propagation (VG path),
+            # which is where SPME edits are applied in `Sam3VideoBase._tracker_update_memories`.
+            # The instance-interactivity propagation runs Tracker-only with `run_mem_encoder=True`,
+            # which bypasses SPME entirely.
+            def propagate_fn(*args, **kwargs):
+                return Sam3VideoInference.propagate_in_video(model, *args, **kwargs)
+        else:
+            propagate_fn = model.propagate_in_video
+
+        for out_frame_idx, out in propagate_fn(
             state,
             start_frame_idx=init_frame_idx,
             max_frame_num_to_track=len(images_pil),
@@ -527,13 +599,163 @@ def run_sam3_tracking(
 
         has_gt_present_before = any(a > 0 for a in areas[:init_frame_idx])
         if has_gt_present_before:
-            for out_frame_idx, out in model.propagate_in_video(
+            for out_frame_idx, out in propagate_fn(
                 state,
                 start_frame_idx=init_frame_idx,
                 max_frame_num_to_track=len(images_pil),
                 reverse=True,
             ):
                 _update_segments(out_frame_idx, out)
+
+        # Extract SPME debug stats (if enabled) from the tracker state's output_dict.
+        # - Learned-gate keys are populated when `SAM3_SPME_LEARNED_GATE_LOG=1`.
+        # - Additional SPME signal keys are populated when `SAM3_SPME_LOG_SIGNALS=1` (or learned-gate log is on).
+        try:
+            if target_obj_id is not None:
+                for tracker_state in state.get("tracker_inference_states", []):
+                    obj_ids = [int(x) for x in tracker_state.get("obj_ids", [])]
+                    if int(target_obj_id) not in obj_ids:
+                        continue
+                    row = int(obj_ids.index(int(target_obj_id)))
+                    out_dict = tracker_state.get("output_dict", {})
+                    non_cond = out_dict.get("non_cond_frame_outputs", {})
+                    cond = out_dict.get("cond_frame_outputs", {})
+                    for local_fidx in range(int(state.get("num_frames", len(images_pil)))):
+                        entry = None
+                        if isinstance(non_cond, dict) and local_fidx in non_cond:
+                            entry = non_cond.get(local_fidx)
+                        if entry is None and isinstance(cond, dict) and local_fidx in cond:
+                            entry = cond.get(local_fidx)
+                        if not isinstance(entry, dict):
+                            continue
+
+                        def _row_scalar(key: str) -> float | None:
+                            t = entry.get(key, None)
+                            if not isinstance(t, torch.Tensor) or t.numel() == 0:
+                                return None
+                            if t.ndim == 0:
+                                return float(t.detach().float().item())
+                            if row >= int(t.shape[0]):
+                                return None
+                            # Reduce over any trailing dimensions.
+                            return float(t[row].detach().float().mean().item())
+
+                        det_score = _row_scalar("spme_det_score_raw")
+                        presence_prob = _row_scalar("spme_presence_prob")
+                        query_cos = _row_scalar("spme_query_cos")
+                        det_trk_iou = _row_scalar("spme_det_trk_iou")
+                        eff_iou_score = _row_scalar("eff_iou_score")
+                        obj_score_logit = _row_scalar("object_score_logits")
+                        iou_score = _row_scalar("iou_score")
+                        fusion_scale_mem = _row_scalar("spme_fusion_scale_mem")
+                        fusion_scale_obj = _row_scalar("spme_fusion_scale_obj")
+                        mem_scale_mean = _row_scalar("spme_gate_mem_scale_mean")
+                        mem_offset_mean_abs = _row_scalar("spme_gate_mem_offset_mean_abs")
+                        decay = _row_scalar("spme_gate_decay")
+                        fusion = _row_scalar("spme_gate_fusion")
+                        reinit = _row_scalar("spme_reinit")
+                        reid_best_sim = _row_scalar("spme_reid_best_sim")
+                        reid_margin = _row_scalar("spme_reid_margin")
+                        reid_accept = _row_scalar("spme_reid_accept")
+                        reid_bank_size = _row_scalar("spme_reid_bank_size")
+                        skip_write = _row_scalar("spme_skip_write")
+
+                        # Optional: compute a more paper-aligned fusion weight from intrinsic tracker signals.
+                        # This affects ONLY the multi-class fused segmentation (label competition), not the
+                        # per-class tracking IoU computed above.
+                        if fusion_weight_mode in {"eff_iou", "reliability"}:
+                            w_new: float | None = None
+                            if fusion_weight_mode == "eff_iou":
+                                w_new = eff_iou_score
+                            else:
+                                if obj_score_logit is not None and iou_score is not None:
+                                    # Match SAM3's `cal_mem_score` objectness normalization:
+                                    # object_score_norm = sigmoid(logit) * 2 - 1 if logit > 0 else 0
+                                    if float(obj_score_logit) > 0.0:
+                                        st = float(1.0 / (1.0 + np.exp(-float(obj_score_logit))))
+                                        st = max(0.0, min(1.0, st * 2.0 - 1.0))
+                                    else:
+                                        st = 0.0
+                                    ct = max(0.0, min(1.0, float(iou_score)))
+                                    w_new = float(st * ct)
+                            if w_new is not None:
+                                video_weights[int(local_fidx)] = float(w_new)
+
+                        if (
+                            det_score is not None
+                            or query_cos is not None
+                            or det_trk_iou is not None
+                            or eff_iou_score is not None
+                            or fusion_scale_mem is not None
+                            or fusion_scale_obj is not None
+                            or mem_scale_mean is not None
+                            or mem_offset_mean_abs is not None
+                            or decay is not None
+                            or fusion is not None
+                            or reinit is not None
+                            or reid_best_sim is not None
+                            or reid_margin is not None
+                            or reid_accept is not None
+                            or reid_bank_size is not None
+                            or skip_write is not None
+                        ):
+                            spme_debug_by_local_frame[int(local_fidx)] = {}
+                            if det_score is not None:
+                                spme_debug_by_local_frame[int(local_fidx)]["det_score"] = float(det_score)
+                            if presence_prob is not None:
+                                spme_debug_by_local_frame[int(local_fidx)]["presence_prob"] = float(presence_prob)
+                            if query_cos is not None:
+                                spme_debug_by_local_frame[int(local_fidx)]["query_cos"] = float(query_cos)
+                            if det_trk_iou is not None:
+                                spme_debug_by_local_frame[int(local_fidx)]["det_trk_iou"] = float(det_trk_iou)
+                            if eff_iou_score is not None:
+                                spme_debug_by_local_frame[int(local_fidx)]["eff_iou_score"] = float(
+                                    eff_iou_score
+                                )
+                            if fusion_scale_mem is not None:
+                                spme_debug_by_local_frame[int(local_fidx)]["fusion_scale_mem"] = float(
+                                    fusion_scale_mem
+                                )
+                            if fusion_scale_obj is not None:
+                                spme_debug_by_local_frame[int(local_fidx)]["fusion_scale_obj"] = float(
+                                    fusion_scale_obj
+                                )
+                            if mem_scale_mean is not None:
+                                spme_debug_by_local_frame[int(local_fidx)][
+                                    "gate_mem_scale_mean"
+                                ] = float(mem_scale_mean)
+                            if mem_offset_mean_abs is not None:
+                                spme_debug_by_local_frame[int(local_fidx)][
+                                    "gate_mem_offset_mean_abs"
+                                ] = float(mem_offset_mean_abs)
+                            if decay is not None:
+                                spme_debug_by_local_frame[int(local_fidx)]["gate_decay"] = float(decay)
+                            if fusion is not None:
+                                spme_debug_by_local_frame[int(local_fidx)]["gate_fusion"] = float(fusion)
+                            if reinit is not None:
+                                spme_debug_by_local_frame[int(local_fidx)]["reinit"] = float(reinit)
+                            if reid_best_sim is not None:
+                                spme_debug_by_local_frame[int(local_fidx)]["reid_best_sim"] = float(
+                                    reid_best_sim
+                                )
+                            if reid_margin is not None:
+                                spme_debug_by_local_frame[int(local_fidx)]["reid_margin"] = float(
+                                    reid_margin
+                                )
+                            if reid_accept is not None:
+                                spme_debug_by_local_frame[int(local_fidx)]["reid_accept"] = float(
+                                    reid_accept
+                                )
+                            if reid_bank_size is not None:
+                                spme_debug_by_local_frame[int(local_fidx)]["reid_bank_size"] = float(
+                                    reid_bank_size
+                                )
+                            if skip_write is not None:
+                                spme_debug_by_local_frame[int(local_fidx)]["skip_write"] = float(skip_write)
+                    break
+        except Exception:
+            # Debug stats are best-effort; never fail evaluation.
+            pass
     
     # Compute metrics for each frame
     for i, (frame_idx, _, _) in enumerate(frames):
@@ -556,6 +778,25 @@ def run_sam3_tracking(
             pred_present=bool(pred_present),
             iou=iou,
             dice=dice,
+            tracker_score=float(video_weights.get(i, 0.0)) if video_weights else 0.0,
+            det_score=spme_debug_by_local_frame.get(i, {}).get("det_score", None),
+            presence_prob=spme_debug_by_local_frame.get(i, {}).get("presence_prob", None),
+            query_cos=spme_debug_by_local_frame.get(i, {}).get("query_cos", None),
+            det_trk_iou=spme_debug_by_local_frame.get(i, {}).get("det_trk_iou", None),
+            fusion_scale_mem=spme_debug_by_local_frame.get(i, {}).get("fusion_scale_mem", None),
+            fusion_scale_obj=spme_debug_by_local_frame.get(i, {}).get("fusion_scale_obj", None),
+            gate_mem_scale_mean=spme_debug_by_local_frame.get(i, {}).get("gate_mem_scale_mean", None),
+            gate_mem_offset_mean_abs=spme_debug_by_local_frame.get(i, {}).get(
+                "gate_mem_offset_mean_abs", None
+            ),
+            gate_decay=spme_debug_by_local_frame.get(i, {}).get("gate_decay", None),
+            gate_fusion=spme_debug_by_local_frame.get(i, {}).get("gate_fusion", None),
+            reinit=spme_debug_by_local_frame.get(i, {}).get("reinit", None),
+            reid_best_sim=spme_debug_by_local_frame.get(i, {}).get("reid_best_sim", None),
+            reid_margin=spme_debug_by_local_frame.get(i, {}).get("reid_margin", None),
+            reid_accept=spme_debug_by_local_frame.get(i, {}).get("reid_accept", None),
+            reid_bank_size=spme_debug_by_local_frame.get(i, {}).get("reid_bank_size", None),
+            skip_write=spme_debug_by_local_frame.get(i, {}).get("skip_write", None),
         ))
     
     return results, video_segments, video_weights
@@ -699,10 +940,20 @@ def main():
     parser.add_argument("--overlay-ckpt", type=str, default=None,
                         help="Optional finetuned checkpoint to overlay on top of base-sam3-pt (loaded with strict=False).")
     parser.add_argument(
+        "--spme-ckpt",
+        type=str,
+        action="append",
+        default=None,
+        help="Optional: path to a trained SPME checkpoint (loads only spme_* params). "
+        "Can be specified multiple times; later checkpoints override earlier ones. "
+        "If provided, this takes precedence over --spme-fusion-ckpt.",
+    )
+    parser.add_argument(
         "--spme-fusion-ckpt",
         type=str,
         default=None,
-        help="Optional: path to a trained SPME checkpoint (loads only spme_* params).",
+        help="Optional (deprecated): path to a trained SPME checkpoint (loads only spme_* params). "
+        "Prefer --spme-ckpt (repeatable) for composing fusion+gate checkpoints.",
     )
     parser.add_argument("--prompt", type=str, default="surgical instrument",
                         help="Text prompt for all classes")
@@ -763,9 +1014,34 @@ def main():
     parser.add_argument("--debug-init", action="store_true",
                         help="Print init-frame candidate stats when selecting target obj_id.")
     parser.add_argument(
+        "--propagation-mode",
+        type=str,
+        default="vg",
+        choices=["vg", "tracker"],
+        help="How to propagate after initialization. "
+             "vg (recommended): SAM3 detector+tracker propagation (applies SPME edits). "
+             "tracker: Tracker-only propagation from the instance-interactivity path (bypasses SPME).",
+    )
+    parser.add_argument(
         "--write-fused-masks",
         action="store_true",
         help="Also write fused multi-class label masks as PNGs (can be large).",
+    )
+    parser.add_argument(
+        "--fusion-weight-mode",
+        type=str,
+        default=os.getenv("ENDOVIS_FUSION_WEIGHT_MODE", "tracker_prob"),
+        choices=["tracker_prob", "det_prob", "eff_iou", "reliability"],
+        help="Quality weight used for multi-class fusion. "
+             "tracker_prob: per-frame tracker confidence (default). "
+             "det_prob: per-frame detector probability. "
+             "eff_iou: Tracker eff_iou_score (intrinsic reliability proxy). "
+             "reliability: st*ct computed from (object_score_logits, iou_score) to match SAM3 cal_mem_score.",
+    )
+    parser.add_argument(
+        "--debug-spme-summary",
+        action="store_true",
+        help="Print + write an aggregated SPME debug summary (gate/fusion stats, ghost/miss) to out_dir.",
     )
     
     args = parser.parse_args()
@@ -816,8 +1092,15 @@ def main():
             f"matched_keys={overlay_keys_after_filter} loaded_keys={loaded_keys} "
             f"missing_keys={len(missing_keys)} unexpected_keys={len(unexpected_keys)}"
         )
-    if args.spme_fusion_ckpt:
-        _apply_spme_fusion_ckpt(model, Path(args.spme_fusion_ckpt))
+
+    spme_ckpts: list[Path] = []
+    if args.spme_ckpt:
+        spme_ckpts = [Path(p) for p in args.spme_ckpt if p]
+    elif args.spme_fusion_ckpt:
+        spme_ckpts = [Path(args.spme_fusion_ckpt)]
+
+    for ckpt_path in spme_ckpts:
+        _apply_spme_fusion_ckpt(model, ckpt_path)
     if args.new_det_thr is not None:
         model.new_det_thresh = float(args.new_det_thr)
         print(f"[config] new_det_thresh={model.new_det_thresh}")
@@ -827,6 +1110,11 @@ def main():
     if args.hotstart_delay is not None:
         model.hotstart_delay = int(args.hotstart_delay)
         print(f"[config] hotstart_delay={model.hotstart_delay}")
+    elif str(args.init_prompt).strip().lower() == "mask" and str(args.propagation_mode).strip().lower() == "vg":
+        # For mask-init tracking, hotstart heuristics (meant to suppress spurious *new* detections)
+        # can accidentally suppress the init object if detector↔tracker matching is weak early on.
+        model.hotstart_delay = 0
+        print(f"[config] hotstart_delay={model.hotstart_delay} (auto for mask-init + vg)")
     
     all_results = []
     fused_results = []
@@ -897,6 +1185,8 @@ def main():
                 init_min_area=args.init_min_area,
                 init_box_pad=args.init_box_pad,
                 debug_init=args.debug_init,
+                propagation_mode=args.propagation_mode,
+                fusion_weight_mode=args.fusion_weight_mode,
             )
             pred_masks_by_class[int(class_id)] = pred_masks
             pred_weights_by_class[int(class_id)] = pred_weights
@@ -962,6 +1252,7 @@ def main():
             print(
                 f"\n  [fused] challenge_iou={fused_metrics['challenge_iou']:.3f} "
                 f"mcIoU_present={fused_metrics['mean_class_iou_present']:.3f} "
+                f"mcIoU_all={fused_metrics.get('mean_class_iou', 0.0):.3f} "
                 f"binary_iou={fused_metrics['binary_iou']:.3f}"
             )
 
@@ -984,6 +1275,7 @@ def main():
         "persistence_lengths": [r.persistence_length for r in all_results if r.persistence_length is not None],
         "fused_mean_challenge_iou": float(np.mean([r["challenge_iou"] for r in fused_results])) if fused_results else 0.0,
         "fused_mean_class_iou_present": float(np.mean([r["mean_class_iou_present"] for r in fused_results])) if fused_results else 0.0,
+        "fused_mean_class_iou": float(np.mean([r.get("mean_class_iou", 0.0) for r in fused_results])) if fused_results else 0.0,
         "fused_mean_binary_iou": float(np.mean([r["binary_iou"] for r in fused_results])) if fused_results else 0.0,
     }
     
@@ -996,6 +1288,199 @@ def main():
     print(f"Mean drift events: {summary['mean_drift_events']:.1f}")
     print(f"Mean max drift: {summary['mean_max_drift']:.1f}")
     print(f"Mean recovery rate: {summary['mean_recovery_rate']:.2f}")
+
+    if args.debug_spme_summary and all_results:
+        # Aggregate per-frame SPME debug signals across all tracked objects.
+        all_frames = []
+        for r in all_results:
+            if getattr(r, "frames", None):
+                all_frames.extend(r.frames)
+
+        def _get(fr, key: str, default=None):
+            # `TrackResult.frames` may contain either dataclass objects (attribute access)
+            # or plain dicts (JSON-ready). Support both.
+            if isinstance(fr, dict):
+                return fr.get(key, default)
+            return getattr(fr, key, default)
+
+        def _num_list(attr: str):
+            vals = []
+            for fr in all_frames:
+                v = _get(fr, attr, None)
+                if v is None:
+                    continue
+                try:
+                    vals.append(float(v))
+                except Exception:
+                    continue
+            return vals
+
+        def _stats(vals: list[float]):
+            if not vals:
+                return None
+            arr = np.asarray(vals, dtype=np.float64)
+            nan_mask = np.isnan(arr)
+            valid = arr[~nan_mask]
+            if valid.size == 0:
+                # Keep JSON standard-compliant (avoid NaN literals).
+                return {
+                    "n": int(arr.size),
+                    "nan": int(nan_mask.sum()),
+                    "nan_frac": float(nan_mask.mean()) if arr.size else 0.0,
+                    "mean": None,
+                    "std": None,
+                    "min": None,
+                    "max": None,
+                    "unique": 0,
+                }
+            return {
+                "n": int(arr.size),
+                "nan": int(nan_mask.sum()),
+                "nan_frac": float(nan_mask.mean()) if arr.size else 0.0,
+                "mean": float(valid.mean()),
+                "std": float(valid.std()),
+                "min": float(valid.min()),
+                "max": float(valid.max()),
+                "unique": int(np.unique(valid).size),
+            }
+
+        # Presence/absence error modes from the same `gt_present/pred_present` fields used in results.json.
+        ghost = 0
+        miss = 0
+        reinit_on_gt_present = 0
+        reinit_on_gt_absent = 0
+        fusion_on_gt_present = 0
+        fusion_on_gt_absent = 0
+        fusion_attr_present = False
+        skip_on_gt_present = 0
+        skip_on_gt_absent = 0
+        skip_attr_present = False
+        tot = 0
+        gt_present_frames = 0
+        for fr in all_frames:
+            gt = bool(_get(fr, "gt_present", False))
+            pred = bool(_get(fr, "pred_present", False))
+            reinit_v = _get(fr, "reinit", 0.0)
+            fusion_v = _get(fr, "fusion_scale_mem", None)
+            skip_v = _get(fr, "skip_write", None)
+            if fusion_v is not None:
+                fusion_attr_present = True
+            if skip_v is not None:
+                skip_attr_present = True
+            try:
+                reinit_on = float(reinit_v) > 0.0
+            except Exception:
+                reinit_on = False
+            try:
+                fusion_on = float(fusion_v) > 0.0 if fusion_v is not None else False
+            except Exception:
+                fusion_on = False
+            try:
+                skip_on = float(skip_v) > 0.0 if skip_v is not None else False
+            except Exception:
+                skip_on = False
+            tot += 1
+            if gt:
+                gt_present_frames += 1
+                if reinit_on:
+                    reinit_on_gt_present += 1
+                if fusion_on:
+                    fusion_on_gt_present += 1
+                if skip_on:
+                    skip_on_gt_present += 1
+            else:
+                if reinit_on:
+                    reinit_on_gt_absent += 1
+                if fusion_on:
+                    fusion_on_gt_absent += 1
+                if skip_on:
+                    skip_on_gt_absent += 1
+            if (not gt) and pred:
+                ghost += 1
+            if gt and (not pred):
+                miss += 1
+
+        fusion_scale_mem = _num_list("fusion_scale_mem")
+        fusion_on_frac = (
+            float(np.mean(np.asarray(fusion_scale_mem) > 0.0)) if fusion_scale_mem else None
+        )
+        gt_absent_frames = tot - gt_present_frames
+        fusion_on_frac_gt_present = (
+            float(fusion_on_gt_present / gt_present_frames)
+            if fusion_attr_present and gt_present_frames
+            else None
+        )
+        fusion_on_frac_gt_absent = (
+            float(fusion_on_gt_absent / gt_absent_frames)
+            if fusion_attr_present and gt_absent_frames > 0
+            else None
+        )
+        reinit_vals = _num_list("reinit")
+        reinit_on_frac = (
+            float(np.mean(np.asarray(reinit_vals) > 0.0)) if reinit_vals else None
+        )
+        reinit_on_frac_gt_present = (
+            float(reinit_on_gt_present / gt_present_frames) if gt_present_frames else None
+        )
+        reinit_on_frac_gt_absent = (
+            float(reinit_on_gt_absent / gt_absent_frames) if gt_absent_frames > 0 else None
+        )
+        skip_write_vals = _num_list("skip_write")
+        skip_write_on_frac = (
+            float(np.mean(np.asarray(skip_write_vals) > 0.0)) if skip_write_vals else None
+        )
+        skip_write_on_frac_gt_present = (
+            float(skip_on_gt_present / gt_present_frames)
+            if skip_attr_present and gt_present_frames
+            else None
+        )
+        skip_write_on_frac_gt_absent = (
+            float(skip_on_gt_absent / gt_absent_frames)
+            if skip_attr_present and gt_absent_frames > 0
+            else None
+        )
+
+        spme_debug = {
+            "gate_mem_scale_mean": _stats(_num_list("gate_mem_scale_mean")),
+            "gate_mem_offset_mean_abs": _stats(_num_list("gate_mem_offset_mean_abs")),
+            "gate_decay": _stats(_num_list("gate_decay")),
+            "gate_fusion": _stats(_num_list("gate_fusion")),
+            "det_trk_iou": _stats(_num_list("det_trk_iou")),
+            "reid_best_sim": _stats(_num_list("reid_best_sim")),
+            "reid_margin": _stats(_num_list("reid_margin")),
+            "reid_accept": _stats(_num_list("reid_accept")),
+            "reid_bank_size": _stats(_num_list("reid_bank_size")),
+            "fusion_scale_mem": _stats(fusion_scale_mem),
+            "fusion_scale_obj": _stats(_num_list("fusion_scale_obj")),
+            "fusion_on_frac": fusion_on_frac,
+            "fusion_on_frac_gt_present": fusion_on_frac_gt_present,
+            "fusion_on_frac_gt_absent": fusion_on_frac_gt_absent,
+            "reinit": _stats(reinit_vals),
+            "reinit_on_frac": reinit_on_frac,
+            "reinit_on_frac_gt_present": reinit_on_frac_gt_present,
+            "reinit_on_frac_gt_absent": reinit_on_frac_gt_absent,
+            "reinit_on_gt_present_frames": int(reinit_on_gt_present),
+            "reinit_on_gt_absent_frames": int(reinit_on_gt_absent),
+            "skip_write": _stats(skip_write_vals),
+            "skip_write_on_frac": skip_write_on_frac,
+            "skip_write_on_frac_gt_present": skip_write_on_frac_gt_present,
+            "skip_write_on_frac_gt_absent": skip_write_on_frac_gt_absent,
+            "skip_write_on_gt_present_frames": int(skip_on_gt_present),
+            "skip_write_on_gt_absent_frames": int(skip_on_gt_absent),
+            "ghost_frames": int(ghost),
+            "ghost_rate_all": float(ghost / tot) if tot else 0.0,
+            "miss_frames": int(miss),
+            "miss_rate_gt_present": float(miss / gt_present_frames) if gt_present_frames else 0.0,
+            "frames_total": int(tot),
+            "frames_gt_present": int(gt_present_frames),
+        }
+
+        with open(out_dir / "spme_debug_summary.json", "w") as f:
+            json.dump(spme_debug, f, indent=2)
+
+        print("\n=== SPME Debug Summary ===")
+        print(json.dumps(spme_debug, indent=2))
+
     print(f"Results saved to: {out_dir}")
 
 

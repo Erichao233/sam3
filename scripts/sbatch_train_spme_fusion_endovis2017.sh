@@ -4,7 +4,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
-#SBATCH -t 12:00:00
+#SBATCH -t 06:00:00
 #SBATCH -J sam3_endovis2017_train_spme_fusion
 #SBATCH -o /home2020/home/icube/kunyuan/SurgBench/SAM/logs/%x-%j.out
 #SBATCH -e /home2020/home/icube/kunyuan/SurgBench/SAM/logs/%x-%j.err
@@ -30,7 +30,8 @@ SAM3_PT=$REPO/sam3.pt
 BPE=$REPO/sam3/assets/bpe_simple_vocab_16e6.txt.gz
 
 # Optional: detector/domain-adaptation checkpoint (Hydra trainer ckpt with ['model']).
-OVERLAY_CKPT="${OVERLAY_CKPT:-/home2020/home/icube/kunyuan/SurgBench/SAM/outputs/sam3_endovis2017_ft_boxprompt/checkpoints/checkpoint_40.pt}"
+# Default: empty (train SPME modules without EndoVis detector adaptation unless explicitly provided).
+OVERLAY_CKPT="${OVERLAY_CKPT:-}"
 
 # Output folder (job-scoped for easy download).
 OUT_ROOT="${OUT_ROOT:-/home2020/home/icube/kunyuan/SurgBench/SAM/outputs/endovis2017_spme_fusion_train_v1/job_${SLURM_JOB_ID:-local}}"
@@ -49,8 +50,8 @@ INIT_PROMPT="${INIT_PROMPT:-mask}"  # mask | box
 PROMPT_MODE="${PROMPT_MODE:-visual}"   # class | generic | visual
 PROMPT="${PROMPT:-surgical instrument}" # only used when PROMPT_MODE=generic
 
-# Stop by wallclock to match SLURM.
-MAX_HOURS="${MAX_HOURS:-11.5}"
+# Stop by wallclock to match SLURM (leave a small buffer for packing logs/ckpts).
+MAX_HOURS="${MAX_HOURS:-5.8}"
 
 # Optim.
 LR="${LR:-1e-3}"
@@ -62,19 +63,23 @@ SEED="${SEED:-123}"
 QUERY_POOL="${QUERY_POOL:-top1}"
 QUERY_TOPK="${QUERY_TOPK:-5}"
 ANCHOR_DET_THR="${ANCHOR_DET_THR:-0.0}"
+POINTER_MODE="${POINTER_MODE:-hybrid}" # top1 | per_object | hybrid
+MATCH_IOU_THR="${MATCH_IOU_THR:-0.1}"
+MATCH_TOPK="${MATCH_TOPK:-20}"
+SCORE_THR_DET="${SCORE_THR_DET:-0.2}"
 
 # Fusion knobs (applied manually inside the trainer).
 FUSION_MODE="${FUSION_MODE:-film}"
 FUSION_ALPHA="${FUSION_ALPHA:-0.05}"
 FUSION_ALPHA_OBJ="${FUSION_ALPHA_OBJ:-0.005}"
-FUSION_DET_THR="${FUSION_DET_THR:-0.3}"
+FUSION_DET_THR="${FUSION_DET_THR:-0.1}"
 FUSION_QCOS_THR="${FUSION_QCOS_THR:-0.5}"
 FUSION_QCOS_TEMP="${FUSION_QCOS_TEMP:-20.0}"
 FUSION_QCOS_GATE="${FUSION_QCOS_GATE:-sigmoid}"
 FUSION_USE_PRESENCE="${FUSION_USE_PRESENCE:-1}"
 
-LOG_EVERY="${LOG_EVERY:-20}"
-SAVE_EVERY="${SAVE_EVERY:-500}"
+LOG_EVERY="${LOG_EVERY:-50}"
+SAVE_EVERY="${SAVE_EVERY:-2000}"
 
 cd "$REPO"
 mkdir -p "$OUT_ROOT"
@@ -84,6 +89,7 @@ echo "DATA=$DATA"
 echo "OVERLAY_CKPT=$OVERLAY_CKPT"
 echo "TRAIN_SEQS=$TRAIN_SEQS ALLOWED_CLASSES=${ALLOWED_CLASSES:-<all>}"
 echo "PROMPT_MODE=$PROMPT_MODE PROMPT=$PROMPT"
+echo "QUERY_POOL=$QUERY_POOL QUERY_TOPK=$QUERY_TOPK ANCHOR_DET_THR=$ANCHOR_DET_THR POINTER_MODE=$POINTER_MODE MATCH_IOU_THR=$MATCH_IOU_THR MATCH_TOPK=$MATCH_TOPK SCORE_THR_DET=$SCORE_THR_DET"
 
 if [[ "$PREPARE_DATA" == "1" || ( "$PREPARE_DATA" == "auto" && ! -d "$DATA/train/image" ) ]]; then
   echo "=== [0/1] Prepare official EndoVis2017 -> canonical layout ==="
@@ -123,6 +129,10 @@ python -u scripts/train_spme_fusion_endovis2017.py \
   --query-pool "$QUERY_POOL" \
   --query-topk "$QUERY_TOPK" \
   --anchor-det-thr "$ANCHOR_DET_THR" \
+  --pointer-mode "$POINTER_MODE" \
+  --match-iou-thr "$MATCH_IOU_THR" \
+  --match-topk "$MATCH_TOPK" \
+  --score-thr-detection "$SCORE_THR_DET" \
   --fusion-mode "$FUSION_MODE" \
   --fusion-alpha "$FUSION_ALPHA" \
   --fusion-alpha-obj "$FUSION_ALPHA_OBJ" \

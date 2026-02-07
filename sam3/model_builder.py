@@ -1,6 +1,7 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates. All Rights Reserved
 
 import os
+import math
 from typing import Optional
 
 import torch
@@ -461,9 +462,27 @@ def build_tracker(
         vision_backbone = _create_vision_backbone(compile_mode=compile_mode)
         backbone = SAM3VLBackbone(scalp=1, visual=vision_backbone, text=None)
     # Create the Tracker module
+    #
+    # Optional env override: memory length (num_maskmem)
+    # - Default SAM3 uses 7 memory slots.
+    # - Surgical videos often need a longer temporal horizon; we support increasing this
+    #   via `SAM3_TRACKER_NUM_MASKMEM`. If this differs from the checkpoint's value, we
+    #   will initialize temporal positional encodings by interpolation at checkpoint load time
+    #   in `build_sam3_video_model` (to avoid random untrained embeddings).
+    num_maskmem_env = os.getenv("SAM3_TRACKER_NUM_MASKMEM", "").strip()
+    num_maskmem = 7
+    if num_maskmem_env:
+        try:
+            num_maskmem = int(num_maskmem_env)
+        except ValueError as e:
+            raise ValueError(
+                f"Invalid SAM3_TRACKER_NUM_MASKMEM={num_maskmem_env!r} (must be int)"
+            ) from e
+        num_maskmem = int(max(0, num_maskmem))
+
     model = Sam3TrackerPredictor(
         image_size=1008,
-        num_maskmem=7,
+        num_maskmem=num_maskmem,
         backbone=backbone,
         backbone_stride=14,
         transformer=transformer,
@@ -496,6 +515,87 @@ def build_tracker(
     )
 
     return model
+
+
+def _piecewise_interpolate_maskmem_tpos_enc(
+    src: torch.Tensor, target_len: int
+) -> torch.Tensor:
+    """
+    Interpolate SAM3 Tracker temporal positional encodings to support a larger memory
+    without retraining.
+
+    The released SAM3 checkpoints are trained with `num_maskmem=7`. If we increase the
+    memory length, the extra positional encodings would otherwise be randomly initialized,
+    which can destabilize tracking. Following the piecewise interpolation scheme described in
+    arXiv:2512.16880v1 (ReMeDI-SAM3), we:
+    - keep the endpoints fixed (p0 and p6),
+    - linearly resample the interior positions (p1..p5) to fill the new length.
+
+    Args:
+        src: Tensor of shape (S, 1, 1, C), where typically S=7.
+        target_len: desired length M (>=2).
+
+    Returns:
+        Tensor of shape (M, 1, 1, C) on the same device/dtype as src.
+    """
+    if not isinstance(src, torch.Tensor):
+        raise TypeError(f"src must be a torch.Tensor, got {type(src)}")
+    if src.ndim != 4 or src.shape[1:3] != (1, 1):
+        raise ValueError(f"Expected src shape (S,1,1,C), got {tuple(src.shape)}")
+
+    src_len = int(src.shape[0])
+    target_len = int(target_len)
+    if target_len <= 0:
+        raise ValueError(f"target_len must be > 0, got {target_len}")
+    if target_len == src_len:
+        return src
+
+    # Flatten to (S, C) for interpolation.
+    src_flat = src[:, 0, 0, :]  # (S, C)
+    C = int(src_flat.shape[1])
+    device = src.device
+    dtype = src.dtype
+
+    if target_len == 1:
+        out_flat = src_flat[:1]
+        return out_flat[:, None, None, :].to(device=device, dtype=dtype)
+
+    out_flat = torch.zeros(target_len, C, device=device, dtype=dtype)
+    out_flat[0] = src_flat[0]
+    out_flat[-1] = src_flat[-1]
+
+    if target_len == 2:
+        return out_flat[:, None, None, :]
+
+    if src_len < 3:
+        # Degenerate: only endpoints exist, interpolate uniformly between them.
+        for k in range(1, target_len - 1):
+            alpha = float(k) / float(target_len - 1)
+            out_flat[k] = (1.0 - alpha) * src_flat[0] + alpha * src_flat[-1]
+        return out_flat[:, None, None, :]
+
+    # Generalized piecewise resampling of interior sequence src[1 : src_len-1].
+    # Map k=1..M-2 to u in [1, src_len-2].
+    interior_max = float(src_len - 2)  # inclusive
+    denom = float(target_len - 3)
+    for k in range(1, target_len - 1):
+        if denom <= 0:
+            # Only one interior point (M=3): take the first interior embedding.
+            u = 1.0
+        else:
+            t = float(k - 1) / denom  # in [0,1]
+            u = 1.0 + (interior_max - 1.0) * t  # in [1, src_len-2]
+        lo = int(math.floor(u))
+        hi = int(math.ceil(u))
+        lo = max(1, min(lo, src_len - 2))
+        hi = max(1, min(hi, src_len - 2))
+        alpha = float(u - lo)
+        if lo == hi:
+            out_flat[k] = src_flat[lo]
+        else:
+            out_flat[k] = (1.0 - alpha) * src_flat[lo] + alpha * src_flat[hi]
+
+    return out_flat[:, None, None, :]
 
 
 def _create_text_encoder(bpe_path: str) -> VETextEncoder:
@@ -820,6 +920,34 @@ def build_sam3_video_model(
             ckpt = torch.load(f, map_location="cpu", weights_only=True)
         if "model" in ckpt and isinstance(ckpt["model"], dict):
             ckpt = ckpt["model"]
+
+        # ------------------------------------------------------------------
+        # Memory expansion support (training-free):
+        # If Tracker is constructed with a different `num_maskmem` than the released
+        # checkpoint (default 7), initialize `tracker.maskmem_tpos_enc` by interpolation
+        # instead of random init (avoids size-mismatch errors and keeps semantics).
+        # ------------------------------------------------------------------
+        try:
+            key = "tracker.maskmem_tpos_enc"
+            if key in ckpt:
+                src = ckpt[key]
+                if isinstance(src, torch.Tensor):
+                    target_len = int(getattr(model.tracker, "num_maskmem", src.shape[0]))
+                    src_len = int(src.shape[0])
+                    if src_len != target_len:
+                        ckpt[key] = _piecewise_interpolate_maskmem_tpos_enc(
+                            src.to(dtype=torch.float32), target_len
+                        ).to(dtype=src.dtype)
+                        print(
+                            f"[ME] Interpolated {key} from len={src_len} -> len={target_len} "
+                            f"(dtype={str(src.dtype).replace('torch.', '')})."
+                        )
+        except Exception as e:
+            raise RuntimeError(
+                "Failed to prepare tracker.maskmem_tpos_enc for memory expansion. "
+                "If you set SAM3_TRACKER_NUM_MASKMEM, ensure it is a valid int and the "
+                "checkpoint contains tracker.maskmem_tpos_enc."
+            ) from e
 
         # We sometimes add small research modules (e.g., SPME-*) that are not present
         # in the released SAM3 checkpoints. To keep strict loading useful while still

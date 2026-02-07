@@ -736,6 +736,7 @@ class Sam3VideoBase(nn.Module):
         new_det_fa_inds: npt.NDArray,
         new_det_obj_ids: npt.NDArray,
         feature_cache: Dict,
+        trk_obj_ids_all: npt.NDArray | None = None,
     ) -> Dict[str, Any] | None:
         """
         Build per-object semantic pointer signals for SPME-Fusion.
@@ -787,6 +788,7 @@ class Sam3VideoBase(nn.Module):
         anchor_det_thr = float(os.getenv("SAM3_SPME_ANCHOR_DET_THR", "0.0"))
 
         query_vec_by_obj: Dict[int, torch.Tensor] = {}
+        det_idx_by_obj: Dict[int, int] = {}
         det_score_by_obj: Dict[int, float] = {}
         qcos_by_obj: Dict[int, float] = {}
 
@@ -821,6 +823,7 @@ class Sam3VideoBase(nn.Module):
             if not (isinstance(qv, torch.Tensor) and qv.numel() > 0):
                 continue
             query_vec_by_obj[int(obj_id)] = qv.detach()
+            det_idx_by_obj[int(obj_id)] = int(det_idx)
             det_score_f = float(scores[det_idx].detach().float().clamp(0.0, 1.0).item())
             det_score_by_obj[int(obj_id)] = det_score_f
 
@@ -855,10 +858,62 @@ class Sam3VideoBase(nn.Module):
                             new = new / new.norm().clamp_min(1e-12)
                             anchor_map[int(obj_id)] = new
 
+        # Optional: fill missing per-object association by anchor similarity (qcos), instead of mask IoU.
+        #
+        # Why this exists:
+        # - SAM3's built-in det↔trk association uses mask IoU thresholds (default 0.5). When drift happens,
+        #   IoU can drop and the association becomes empty, exactly when SPME should intervene.
+        # - For SPME (gate/fusion), we can associate a detection to a tracked identity using the detector
+        #   query embedding and a per-object anchor pointer (qcos), without requiring overlap.
+        #
+        # Safety:
+        # - Only enabled when `SAM3_SPME_PER_OBJECT_ANCHOR_MATCH=1`.
+        # - Requires an existing anchor for the object.
+        # - Respects `SAM3_SPME_ANCHOR_DET_THR` as a minimum det-score filter (if set > 0).
+        #
+        # NOTE: This is identity association for editing / triggers. It does NOT alter which objects
+        # are tracked by SAM3, and it does NOT create new objects.
+        allow_anchor_match = os.getenv("SAM3_SPME_PER_OBJECT_ANCHOR_MATCH", "0") == "1"
+        if allow_anchor_match and isinstance(trk_obj_ids_all, np.ndarray) and trk_obj_ids_all.size > 0:
+            for obj_id in trk_obj_ids_all.astype(np.int64).tolist():
+                obj_id_i = int(obj_id)
+                if obj_id_i in det_idx_by_obj:
+                    continue
+                anchor = anchor_map.get(obj_id_i, None)
+                if not isinstance(anchor, torch.Tensor) or anchor.numel() == 0:
+                    continue
+
+                best_idx: int | None = None
+                best_cos: float | None = None
+                for det_i in range(int(scores.numel())):
+                    ds = float(scores[det_i].detach().float().clamp(0.0, 1.0).item())
+                    if anchor_det_thr > 0.0 and ds < anchor_det_thr:
+                        continue
+                    qv = q_det[det_i]
+                    if not (isinstance(qv, torch.Tensor) and qv.numel() > 0):
+                        continue
+                    cos = float(self._cosine_sim_1d(anchor.to(device=qv.device), qv))
+                    if best_cos is None or cos > best_cos:
+                        best_cos = cos
+                        best_idx = int(det_i)
+                if best_idx is None:
+                    continue
+
+                qv = q_det[best_idx]
+                if not (isinstance(qv, torch.Tensor) and qv.numel() > 0):
+                    continue
+                query_vec_by_obj[obj_id_i] = qv.detach()
+                det_idx_by_obj[obj_id_i] = int(best_idx)
+                det_score_by_obj[obj_id_i] = float(
+                    scores[best_idx].detach().float().clamp(0.0, 1.0).item()
+                )
+                qcos_by_obj[obj_id_i] = float(best_cos) if best_cos is not None else 0.0
+
         if not query_vec_by_obj:
             return None
         return {
             "spme_query_vec_by_obj": query_vec_by_obj,
+            "spme_det_idx_by_obj": det_idx_by_obj,
             "spme_det_score_raw_by_obj": det_score_by_obj,
             "spme_query_cos_by_obj": qcos_by_obj,
         }
@@ -966,6 +1021,447 @@ class Sam3VideoBase(nn.Module):
                     tracker_states_local[idx], run_mem_encoder=True
                 )
         return tracker_states_local
+
+    def _spme_reid_extract_descriptor(
+        self,
+        *,
+        frame_idx: int,
+        feature_cache: Dict,
+        mask_lr: Tensor,
+    ) -> Tensor | None:
+        """
+        Extract a lightweight multi-scale appearance descriptor from the tracker backbone FPN,
+        by masked average pooling within `mask_lr` (EndoVis-style re-ID).
+
+        This is inspired by arXiv:2512.16880v1 Sec 3.3.3 ("Reference Feature Bank"):
+        for each scale l, average the backbone feature map within the predicted mask.
+
+        Returns:
+            1D float32 CPU tensor (normalized), or None if features/mask are invalid.
+        """
+        try:
+            cached = feature_cache.get(int(frame_idx), None)
+            if not isinstance(cached, tuple) or len(cached) != 2:
+                return None
+            _, backbone_cache = cached
+            if not isinstance(backbone_cache, dict):
+                return None
+            tracker_backbone_out = backbone_cache.get("tracker_backbone_out", None)
+            if not isinstance(tracker_backbone_out, dict):
+                return None
+            fpn = tracker_backbone_out.get("backbone_fpn", None)
+            if not isinstance(fpn, list) or len(fpn) == 0:
+                return None
+
+            if not isinstance(mask_lr, torch.Tensor):
+                return None
+            m = mask_lr
+            if m.ndim != 2:
+                return None
+            if m.dtype != torch.bool:
+                m = m > 0
+
+            desc_parts: list[Tensor] = []
+            for feat in fpn:
+                if not isinstance(feat, torch.Tensor) or feat.numel() == 0:
+                    continue
+                f = feat
+                if f.ndim == 4:
+                    f = f[0]
+                if f.ndim != 3:
+                    continue
+                C, H, W = int(f.shape[0]), int(f.shape[1]), int(f.shape[2])
+                if C <= 0 or H <= 0 or W <= 0:
+                    continue
+
+                m_rs = F.interpolate(
+                    m[None, None].float(),
+                    size=(H, W),
+                    mode="nearest",
+                )[0, 0] > 0.5
+                if not bool(m_rs.any().item()):
+                    return None
+
+                f_flat = f.reshape(C, H * W).float()
+                m_flat = m_rs.reshape(H * W)
+                pooled = f_flat[:, m_flat].mean(dim=1)
+                pooled = F.normalize(pooled, dim=0, eps=1e-6)
+                desc_parts.append(pooled.detach().cpu())
+
+            if not desc_parts:
+                return None
+            desc = torch.cat(desc_parts, dim=0).float()
+            desc = F.normalize(desc, dim=0, eps=1e-6)
+            return desc
+        except Exception:
+            return None
+
+    @staticmethod
+    def _spme_reid_mean_sim(desc: Tensor, bank: list[Tensor]) -> float | None:
+        try:
+            if not isinstance(desc, torch.Tensor) or desc.numel() == 0:
+                return None
+            if not isinstance(bank, list) or len(bank) == 0:
+                return None
+            bank_t = torch.stack([b.float() for b in bank], dim=0)  # (N, D)
+            bank_t = F.normalize(bank_t, dim=1, eps=1e-6)
+            d = desc.float()
+            d = F.normalize(d, dim=0, eps=1e-6)
+            sims = (bank_t * d.view(1, -1)).sum(dim=1).clamp(-1.0, 1.0)
+            return float(sims.mean().item())
+        except Exception:
+            return None
+
+    def _spme_compute_reinit_det_idx_by_obj(
+        self,
+        *,
+        frame_idx: int,
+        reverse: bool,
+        det_out: Dict[str, Any],
+        per_obj_ctx: Dict[str, Any] | None,
+        tracker_metadata_prev: Dict[str, npt.NDArray],
+        tracker_low_res_masks_global: Tensor,
+        tracker_obj_scores_global: Tensor,
+        feature_cache: Dict,
+    ) -> Dict[int, int]:
+        """
+        Identity-safe "re-init" (burst refresh) plan.
+
+        When the tracker becomes uncertain for several frames (occlusion / drift), and the detector
+        produces a high-confidence + identity-consistent match, we refresh the memory write mask to
+        the detector mask for that frame.
+
+        This is inference-time only and is designed for PROMPT=visual (no language prompts).
+        """
+        if os.getenv("SAM3_SPME_REINIT", "0") != "1":
+            return {}
+        if reverse and os.getenv("SAM3_SPME_REINIT_ALLOW_REVERSE", "0") != "1":
+            return {}
+
+        det_idx_by_obj = {}
+        det_score_by_obj = {}
+        qcos_by_obj = {}
+        if isinstance(per_obj_ctx, dict):
+            det_idx_by_obj = per_obj_ctx.get("spme_det_idx_by_obj", {}) or {}
+            det_score_by_obj = per_obj_ctx.get("spme_det_score_raw_by_obj", {}) or {}
+            qcos_by_obj = per_obj_ctx.get("spme_query_cos_by_obj", {}) or {}
+        if not isinstance(det_idx_by_obj, dict):
+            det_idx_by_obj = {}
+        if not isinstance(det_score_by_obj, dict):
+            det_score_by_obj = {}
+        if not isinstance(qcos_by_obj, dict):
+            qcos_by_obj = {}
+
+        obj_ids_all = tracker_metadata_prev.get("obj_ids_all_gpu", None)
+        if not isinstance(obj_ids_all, np.ndarray) or obj_ids_all.size == 0:
+            return {}
+
+        # Thresholds (minimal and interpretable).
+        det_present_thr = float(os.getenv("SAM3_SPME_LEARNED_GATE_DET_PRESENT_THR", "0.3"))
+        reinit_det_thr = float(os.getenv("SAM3_SPME_REINIT_DET_THR", "0.7"))
+        reinit_qcos_thr = float(os.getenv("SAM3_SPME_REINIT_QCOS_THR", "0.7"))
+        reinit_tracker_thr = float(os.getenv("SAM3_SPME_REINIT_TRACKER_THR", "0.8"))
+        miss_thr = int(os.getenv("SAM3_SPME_REINIT_MISS_THR", "3"))
+        confirm_thr = int(os.getenv("SAM3_SPME_REINIT_CONFIRM_THR", "2"))
+        confirm_iou_thr = float(os.getenv("SAM3_SPME_REINIT_CONFIRM_IOU_THR", "0.2"))
+        iou_thr = float(os.getenv("SAM3_SPME_REINIT_IOU_THR", "0.2"))
+        mismatch_thr = int(os.getenv("SAM3_SPME_REINIT_MISMATCH_THR", "2"))
+        enable_mismatch = os.getenv("SAM3_SPME_REINIT_ENABLE_MISMATCH", "0") == "1"
+        # If the tracker mask is empty (lost), allowing re-init effectively becomes re-detection.
+        # This is high-risk for false positives; keep disabled by default and evaluate as ablation.
+        allow_empty = os.getenv("SAM3_SPME_REINIT_ALLOW_EMPTY", "0") == "1"
+        cooldown_frames = int(os.getenv("SAM3_SPME_REINIT_COOLDOWN", "8"))
+        miss_thr = int(max(1, miss_thr))
+        confirm_thr = int(max(1, confirm_thr))
+        mismatch_thr = int(max(1, mismatch_thr))
+        cooldown_frames = int(max(0, cooldown_frames))
+
+        # Persistent state on rank0 (feature_cache is local per rank; we only compute plan on rank0).
+        state = feature_cache.setdefault("spme_reinit_state", {})
+        # Re-init should be rare and safe. We track two streaks:
+        # - fail_count: tracker is uncertain (low tracker_score) or empty
+        # - det_good_count: detector is confident + identity-consistent (det_score/qcos)
+        # We trigger only when both streaks persist, and when det↔trk overlap is sane.
+        fail_map: Dict[int, int] = state.setdefault("fail_count", {})
+        det_good_map: Dict[int, int] = state.setdefault("det_good_count", {})
+        mismatch_map: Dict[int, int] = state.setdefault("mismatch_count", {})
+        cooldown_map: Dict[int, int] = state.setdefault("cooldown", {})
+
+        # Optional: feature-based re-identification (ReMeDI-style) to validate detector candidates,
+        # enabling safer re-init / re-detection after long occlusions.
+        #
+        # Ref: arXiv:2512.16880v1 Sec 3.3.3.
+        reid_enabled = os.getenv("SAM3_SPME_REID", "0") == "1"
+        reid_bank_size = int(os.getenv("SAM3_SPME_REID_BANK_SIZE", "20"))
+        reid_margin_thr = float(os.getenv("SAM3_SPME_REID_MARGIN", "0.01"))
+        reid_self_thr = float(os.getenv("SAM3_SPME_REID_SELF_THR", "0.0"))
+        reid_use_other_banks = os.getenv("SAM3_SPME_REID_USE_OTHER_BANKS", "1") == "1"
+        reid_update_bank = os.getenv("SAM3_SPME_REID_UPDATE", "1") == "1"
+        reid_bank_size = int(max(1, reid_bank_size))
+        reid_best_sim_by_obj: Dict[int, float] = {}
+        reid_margin_by_obj: Dict[int, float] = {}
+        reid_accept_by_obj: Dict[int, int] = {}
+        reid_bank_size_by_obj: Dict[int, int] = {}
+        bank_map: Dict[int, list[Tensor]] | None = None
+        if reid_enabled:
+            bank_map = feature_cache.setdefault("spme_reid_bank", {})
+            if not isinstance(bank_map, dict):
+                bank_map = None
+
+        # Optional fallback: when det↔trk IoU matching fails (drift), retrieve a detector candidate by
+        # anchor similarity (query embedding), independent of current overlap.
+        q_det = det_out.get("query_vecs", None)
+        scores = det_out.get("scores", None)
+        det_masks = det_out.get("mask", None)
+        anchor_map = feature_cache.get("spme_obj_anchor", {})
+
+        id_to_trk_idx = {
+            int(obj_id): int(i)
+            for i, obj_id in enumerate(obj_ids_all.astype(np.int64).tolist())
+        }
+
+        plan: Dict[int, int] = {}
+        for oid in obj_ids_all.astype(np.int64).tolist():
+            obj_id = int(oid)
+
+            # Cooldown bookkeeping.
+            cd = int(cooldown_map.get(obj_id, 0))
+            if cd > 0:
+                cooldown_map[obj_id] = cd - 1
+
+            fail_prev = int(fail_map.get(obj_id, 0))
+            det_good_prev = int(det_good_map.get(obj_id, 0))
+            mismatch_prev = int(mismatch_map.get(obj_id, 0))
+
+            if int(cooldown_map.get(obj_id, 0)) > 0:
+                continue
+
+            det_idx = det_idx_by_obj.get(obj_id, None)
+            det_score = float(det_score_by_obj.get(obj_id, 0.0))
+            qcos = float(qcos_by_obj.get(obj_id, -1.0))
+
+            # Tracker uncertainty / emptiness for this object.
+            trk_idx = id_to_trk_idx.get(int(obj_id), None)
+            if trk_idx is None:
+                continue
+            try:
+                trk_score = float(
+                    tracker_obj_scores_global[trk_idx].detach().float().item()
+                )
+            except Exception:
+                trk_score = 0.0
+            try:
+                trk_bin = tracker_low_res_masks_global[trk_idx] > 0
+                trk_empty = not bool(trk_bin.any().item())
+            except Exception:
+                trk_empty = False
+
+            # ReID bank bootstrap/update using current tracker prediction.
+            if reid_enabled and isinstance(bank_map, dict):
+                bank = bank_map.get(int(obj_id), None)
+                if bank is None:
+                    bank = []
+                    bank_map[int(obj_id)] = bank
+                # Bootstrap once when empty (the init frame is GT-mask for our EndoVis protocol).
+                if len(bank) == 0 and not bool(trk_empty):
+                    desc0 = self._spme_reid_extract_descriptor(
+                        frame_idx=int(frame_idx),
+                        feature_cache=feature_cache,
+                        mask_lr=trk_bin.detach(),
+                    )
+                    if isinstance(desc0, torch.Tensor):
+                        bank.append(desc0)
+                reid_bank_size_by_obj[int(obj_id)] = int(len(bank))
+
+            # Fallback retrieval by anchor similarity when no matched detection exists.
+            if det_idx is None and isinstance(anchor_map, dict):
+                anchor = anchor_map.get(obj_id, None)
+                if (
+                    isinstance(anchor, torch.Tensor)
+                    and isinstance(q_det, torch.Tensor)
+                    and isinstance(scores, torch.Tensor)
+                    and q_det.numel() > 0
+                    and scores.numel() > 0
+                ):
+                    try:
+                        a = anchor.detach().float()
+                        if a.ndim > 1:
+                            a = a.reshape(-1)
+                        a = a / a.norm().clamp_min(1e-6)
+                        a = a.to(device=q_det.device)
+
+                        qv = q_det.detach().float()
+                        if qv.ndim > 2:
+                            qv = qv.reshape(int(qv.shape[0]), -1)
+                        qv = qv / qv.norm(dim=1, keepdim=True).clamp_min(1e-6)
+                        cos = torch.matmul(qv, a)
+
+                        keep = scores.detach().float().clamp(0.0, 1.0) >= float(det_present_thr)
+                        if bool(keep.any().item()):
+                            cos_keep = cos.masked_fill(~keep, float("-inf"))
+                            best = int(torch.argmax(cos_keep).item())
+                            if math.isfinite(float(cos_keep[best].item())):
+                                det_idx = best
+                                det_score = float(scores[best].detach().float().clamp(0.0, 1.0).item())
+                                qcos = float(cos[best].detach().float().clamp(-1.0, 1.0).item())
+                    except Exception:
+                        det_idx = None
+
+            det_present = det_idx is not None and float(det_score) >= float(det_present_thr)
+
+            # Optional: apply ReID validation on the matched detection candidate.
+            reid_best_sim = float("nan")
+            reid_margin = float("nan")
+            reid_accept = False
+            if (
+                reid_enabled
+                and det_present
+                and isinstance(bank_map, dict)
+                and isinstance(det_masks, torch.Tensor)
+                and int(det_masks.shape[0]) > int(det_idx)
+                and int(det_idx) >= 0
+            ):
+                bank = bank_map.get(int(obj_id), None)
+                if isinstance(bank, list) and len(bank) > 0:
+                    det_bin_for_desc = det_masks[int(det_idx)] > 0
+                    desc = self._spme_reid_extract_descriptor(
+                        frame_idx=int(frame_idx),
+                        feature_cache=feature_cache,
+                        mask_lr=det_bin_for_desc.detach(),
+                    )
+                    if isinstance(desc, torch.Tensor):
+                        sself = self._spme_reid_mean_sim(desc, bank)
+                        if sself is None:
+                            sself = 0.0
+                        other_best = None
+                        if reid_use_other_banks:
+                            for oid2, bank2 in bank_map.items():
+                                if int(oid2) == int(obj_id):
+                                    continue
+                                if not isinstance(bank2, list) or len(bank2) == 0:
+                                    continue
+                                sim2 = self._spme_reid_mean_sim(desc, bank2)
+                                if sim2 is None:
+                                    continue
+                                other_best = sim2 if other_best is None else max(other_best, sim2)
+                        reid_best_sim = float(sself)
+                        if other_best is None:
+                            # Single-object tracking case: no cross-class banks exist, so margin is undefined.
+                            # Fall back to an absolute self-similarity threshold.
+                            reid_margin = float("nan")
+                            reid_accept = reid_best_sim >= float(reid_self_thr)
+                        else:
+                            reid_margin = float(sself - float(other_best))
+                            reid_accept = (reid_best_sim >= float(reid_self_thr)) and (
+                                reid_margin >= float(reid_margin_thr)
+                            )
+            reid_best_sim_by_obj[int(obj_id)] = float(reid_best_sim)
+            reid_margin_by_obj[int(obj_id)] = float(reid_margin)
+            reid_accept_by_obj[int(obj_id)] = int(1 if reid_accept else 0)
+
+            det_good = det_present and det_score >= reinit_det_thr and qcos >= reinit_qcos_thr
+            if reid_enabled:
+                det_good = bool(det_good and reid_accept)
+            det_good_new = det_good_prev + 1 if det_good else 0
+
+            tracker_fail = bool(trk_empty) or float(trk_score) < float(reinit_tracker_thr)
+            fail_new = fail_prev + 1 if tracker_fail else 0
+
+            # det↔trk IoU for identity-safe sanity checks.
+            iou_f = None
+            if (
+                det_present
+                and isinstance(det_masks, torch.Tensor)
+                and int(det_masks.shape[0]) > int(det_idx)
+                and int(det_idx) >= 0
+                and isinstance(tracker_low_res_masks_global, torch.Tensor)
+                and int(tracker_low_res_masks_global.shape[0]) > 0
+            ):
+                try:
+                    det_bin = det_masks[int(det_idx)] > 0
+                    trk_bin = tracker_low_res_masks_global[trk_idx] > 0
+                    iou = mask_iou(det_bin.unsqueeze(0), trk_bin.unsqueeze(0))
+                    iou_f = float(iou.detach().float().clamp(0.0, 1.0).item())
+                except Exception:
+                    iou_f = None
+
+            mismatch_new = 0
+            if enable_mismatch and iou_f is not None:
+                mismatch_new = mismatch_prev + 1 if iou_f < float(iou_thr) else 0
+
+            # Online ReID bank update on *reliable* frames (avoid feature contamination).
+            #
+            # ReMeDI-SAM3 updates the reference feature bank online, but only from frames that are
+            # both reliable and certain. Here we approximate that by requiring:
+            # - tracker not empty + high tracker_score
+            # - detector candidate present + confident + identity-consistent (det_score/qcos)
+            # - det↔trk overlap not too small (IoU >= confirm_iou_thr)
+            if (
+                reid_enabled
+                and reid_update_bank
+                and isinstance(bank_map, dict)
+                and not bool(trk_empty)
+                and det_present
+                and det_score >= float(reinit_det_thr)
+                and qcos >= float(reinit_qcos_thr)
+                and iou_f is not None
+                and float(iou_f) >= float(confirm_iou_thr)
+                and float(trk_score) >= float(reinit_tracker_thr)
+            ):
+                bank = bank_map.get(int(obj_id), None)
+                if isinstance(bank, list):
+                    desc_u = self._spme_reid_extract_descriptor(
+                        frame_idx=int(frame_idx),
+                        feature_cache=feature_cache,
+                        mask_lr=trk_bin.detach(),
+                    )
+                    if isinstance(desc_u, torch.Tensor):
+                        bank.append(desc_u)
+                        if len(bank) > int(reid_bank_size):
+                            # Keep the most recent descriptors.
+                            bank[:] = bank[-int(reid_bank_size) :]
+                    reid_bank_size_by_obj[int(obj_id)] = int(len(bank))
+
+            can_refresh = det_good and (
+                (not bool(trk_empty) and iou_f is not None and float(iou_f) >= float(confirm_iou_thr))
+                or (bool(trk_empty) and bool(allow_empty))
+            )
+
+            triggered = False
+            # Primary (safe) trigger: tracker is uncertain for K frames and the detector is stably
+            # confident + identity-consistent for T frames, with a basic overlap sanity check.
+            if can_refresh and fail_new >= miss_thr and det_good_new >= confirm_thr:
+                triggered = True
+            # Optional drift trigger (off by default): sustained det↔trk mismatch while tracker is
+            # still uncertain. This is riskier and should be evaluated as an ablation.
+            elif (
+                enable_mismatch
+                and det_good
+                and mismatch_new >= mismatch_thr
+                and (float(trk_score) < float(reinit_tracker_thr) or bool(reid_enabled))
+                and (not bool(trk_empty) or bool(allow_empty))
+            ):
+                triggered = True
+
+            if triggered and det_idx is not None:
+                plan[obj_id] = int(det_idx)
+                fail_new = 0
+                det_good_new = 0
+                mismatch_new = 0
+                cooldown_map[obj_id] = cooldown_frames
+
+            fail_map[obj_id] = int(fail_new)
+            det_good_map[obj_id] = int(det_good_new)
+            mismatch_map[obj_id] = int(mismatch_new)
+
+        # Stash ReID stats for logging in `_tracker_update_memories` (best-effort).
+        if reid_enabled:
+            state["reid_best_sim_by_obj"] = reid_best_sim_by_obj
+            state["reid_margin_by_obj"] = reid_margin_by_obj
+            state["reid_accept_by_obj"] = reid_accept_by_obj
+            state["reid_bank_size_by_obj"] = reid_bank_size_by_obj
+
+        return plan
 
     def run_tracker_update_planning_phase(
         self,
@@ -1229,7 +1725,129 @@ class Sam3VideoBase(nn.Module):
                 new_det_fa_inds=new_det_fa_inds,
                 new_det_obj_ids=new_det_obj_ids,
                 feature_cache=feature_cache,
+                trk_obj_ids_all=tracker_metadata_prev.get("obj_ids_all_gpu", None),
             )
+
+            # Optional: identity-safe burst refresh (detector-guided re-init).
+            #
+            # We compute the plan on rank0, broadcast it, and override the masks used for
+            # memory encoding on this frame for selected objects. This targets long-occlusion
+            # recovery / drift, without relying on language prompts.
+            spme_reinit_det_idx_by_obj: Dict[int, int] = {}
+            if os.getenv("SAM3_SPME_REINIT", "0") == "1":
+                if self.rank == 0:
+                    spme_reinit_det_idx_by_obj = self._spme_compute_reinit_det_idx_by_obj(
+                        frame_idx=frame_idx,
+                        reverse=reverse,
+                        det_out=det_out,
+                        per_obj_ctx=per_obj_ctx,
+                        tracker_metadata_prev=tracker_metadata_prev,
+                        tracker_low_res_masks_global=tracker_low_res_masks_global,
+                        tracker_obj_scores_global=tracker_obj_scores_global,
+                        feature_cache=feature_cache,
+                    )
+                if self.world_size > 1:
+                    plan_list = [spme_reinit_det_idx_by_obj] if self.rank == 0 else [None]
+                    self.broadcast_python_obj_cpu(plan_list, src=0)
+                    spme_reinit_det_idx_by_obj = plan_list[0] or {}
+
+                if spme_reinit_det_idx_by_obj:
+                    try:
+                        obj_ids_all = tracker_metadata_prev.get("obj_ids_all_gpu", None)
+                        if isinstance(obj_ids_all, np.ndarray):
+                            id_to_idx = {
+                                int(obj_id): int(i)
+                                for i, obj_id in enumerate(obj_ids_all.astype(np.int64).tolist())
+                            }
+                            for obj_id, det_idx in spme_reinit_det_idx_by_obj.items():
+                                trk_idx = id_to_idx.get(int(obj_id), None)
+                                if trk_idx is None:
+                                    continue
+                                di = int(det_idx)
+                                if di < 0 or di >= int(det_mask_preds.shape[0]):
+                                    continue
+                                tracker_low_res_masks_global[trk_idx] = det_mask_preds[di].to(
+                                    tracker_low_res_masks_global.device
+                                )
+                    except Exception:
+                        # Best-effort: never break tracking.
+                        spme_reinit_det_idx_by_obj = {}
+
+            # Store in the update plan so rank0 can override outputs for the same frame.
+            tracker_update_plan["spme_reinit_det_idx_by_obj"] = spme_reinit_det_idx_by_obj
+
+            # Optional: ReID debug scalars (computed on rank0 inside `_spme_compute_reinit_det_idx_by_obj`).
+            spme_reid_best_sim_by_obj: Dict[int, float] | None = None
+            spme_reid_margin_by_obj: Dict[int, float] | None = None
+            spme_reid_accept_by_obj: Dict[int, int] | None = None
+            spme_reid_bank_size_by_obj: Dict[int, int] | None = None
+            if os.getenv("SAM3_SPME_REID", "0") == "1":
+                if self.rank == 0:
+                    st = feature_cache.get("spme_reinit_state", {})
+                    if isinstance(st, dict):
+                        spme_reid_best_sim_by_obj = st.get("reid_best_sim_by_obj", None)
+                        spme_reid_margin_by_obj = st.get("reid_margin_by_obj", None)
+                        spme_reid_accept_by_obj = st.get("reid_accept_by_obj", None)
+                        spme_reid_bank_size_by_obj = st.get("reid_bank_size_by_obj", None)
+                if self.world_size > 1:
+                    # Broadcast dicts from rank0 to keep logging consistent.
+                    payload = (
+                        [spme_reid_best_sim_by_obj] if self.rank == 0 else [None]
+                    )
+                    self.broadcast_python_obj_cpu(payload, src=0)
+                    spme_reid_best_sim_by_obj = payload[0]
+
+                    payload = [spme_reid_margin_by_obj] if self.rank == 0 else [None]
+                    self.broadcast_python_obj_cpu(payload, src=0)
+                    spme_reid_margin_by_obj = payload[0]
+
+                    payload = [spme_reid_accept_by_obj] if self.rank == 0 else [None]
+                    self.broadcast_python_obj_cpu(payload, src=0)
+                    spme_reid_accept_by_obj = payload[0]
+
+                    payload = (
+                        [spme_reid_bank_size_by_obj] if self.rank == 0 else [None]
+                    )
+                    self.broadcast_python_obj_cpu(payload, src=0)
+                    spme_reid_bank_size_by_obj = payload[0]
+
+            # det↔trk IoU (per object) for drift-aware fusion triggers and debug logging.
+            #
+            # NOTE: We only compute IoU for objects with a matched detection index (from det↔trk matching),
+            # and we skip empty tracker masks to avoid turning fusion into re-detection.
+            spme_det_trk_iou_by_obj: Dict[int, float] | None = None
+            try:
+                det_idx_by_obj = (
+                    per_obj_ctx.get("spme_det_idx_by_obj", None) if isinstance(per_obj_ctx, dict) else None
+                )
+                obj_ids_all = tracker_metadata_prev.get("obj_ids_all_gpu", None)
+                if isinstance(det_idx_by_obj, dict) and det_idx_by_obj and isinstance(obj_ids_all, np.ndarray):
+                    id_to_idx = {
+                        int(obj_id): int(i)
+                        for i, obj_id in enumerate(obj_ids_all.astype(np.int64).tolist())
+                    }
+                    spme_det_trk_iou_by_obj = {}
+                    for oid, det_idx in det_idx_by_obj.items():
+                        obj_id = int(oid)
+                        trk_idx = id_to_idx.get(obj_id, None)
+                        if trk_idx is None:
+                            continue
+                        di = int(det_idx)
+                        if di < 0 or di >= int(det_mask_preds.shape[0]):
+                            continue
+                        trk_bin = tracker_low_res_masks_global[trk_idx] > 0
+                        if not bool(trk_bin.any().item()):
+                            continue
+                        det_bin = det_mask_preds[di] > 0
+                        iou = mask_iou(det_bin.unsqueeze(0), trk_bin.unsqueeze(0))
+                        spme_det_trk_iou_by_obj[obj_id] = float(
+                            iou.detach().float().clamp(0.0, 1.0).item()
+                        )
+                    if not spme_det_trk_iou_by_obj:
+                        spme_det_trk_iou_by_obj = None
+            except Exception:
+                spme_det_trk_iou_by_obj = None
+
             self._tracker_update_memories(
                 tracker_states_local,
                 frame_idx,
@@ -1250,6 +1868,12 @@ class Sam3VideoBase(nn.Module):
                 spme_query_cos_by_obj=(
                     per_obj_ctx.get("spme_query_cos_by_obj", None) if per_obj_ctx else None
                 ),
+                spme_det_trk_iou_by_obj=spme_det_trk_iou_by_obj,
+                spme_reinit_by_obj=spme_reinit_det_idx_by_obj if spme_reinit_det_idx_by_obj else None,
+                spme_reid_best_sim_by_obj=spme_reid_best_sim_by_obj,
+                spme_reid_margin_by_obj=spme_reid_margin_by_obj,
+                spme_reid_accept_by_obj=spme_reid_accept_by_obj,
+                spme_reid_bank_size_by_obj=spme_reid_bank_size_by_obj,
                 track_in_reverse=reverse,
             )
 
@@ -1503,6 +2127,29 @@ class Sam3VideoBase(nn.Module):
 
                     det_mask_final = det_mask_resized.squeeze(0)
                     obj_id_to_mask[obj_id] = det_mask_final
+
+        # Part 4: Override masks for SPME re-init objects (identity-safe burst refresh).
+        spme_reinit_det_idx_by_obj = tracker_update_plan.get("spme_reinit_det_idx_by_obj", {})
+        if isinstance(spme_reinit_det_idx_by_obj, dict) and len(spme_reinit_det_idx_by_obj) > 0:
+            for obj_id, det_idx in spme_reinit_det_idx_by_obj.items():
+                try:
+                    di = int(det_idx)
+                except Exception:
+                    continue
+                if di < 0 or di >= int(det_out["mask"].shape[0]):
+                    continue
+                det_mask = det_out["mask"][di]
+                det_mask = det_mask.unsqueeze(0).unsqueeze(0)
+                det_mask_resized = (
+                    F.interpolate(
+                        det_mask.float(),
+                        size=(orig_vid_height, orig_vid_width),
+                        mode="bilinear",
+                        align_corners=False,
+                    )
+                    > 0
+                )
+                obj_id_to_mask[int(obj_id)] = det_mask_resized.squeeze(0)
 
         return obj_id_to_mask
 
@@ -1943,6 +2590,12 @@ class Sam3VideoBase(nn.Module):
         spme_query_vec_by_obj: Dict[int, Tensor] | None = None,
         spme_det_score_raw_by_obj: Dict[int, float] | None = None,
         spme_query_cos_by_obj: Dict[int, float] | None = None,
+        spme_det_trk_iou_by_obj: Dict[int, float] | None = None,
+        spme_reinit_by_obj: Dict[int, int] | None = None,
+        spme_reid_best_sim_by_obj: Dict[int, float] | None = None,
+        spme_reid_margin_by_obj: Dict[int, float] | None = None,
+        spme_reid_accept_by_obj: Dict[int, int] | None = None,
+        spme_reid_bank_size_by_obj: Dict[int, int] | None = None,
         track_in_reverse: bool = False,
     ):
         """
@@ -1964,6 +2617,7 @@ class Sam3VideoBase(nn.Module):
             learned_gate_enabled
             and os.getenv("SAM3_SPME_LEARNED_GATE_LOG", "0") == "1"
         )
+        signals_log_to_out = learned_gate_log_to_out or os.getenv("SAM3_SPME_LOG_SIGNALS", "0") == "1"
 
         gate: float | None = None
         gate_by_obj: Dict[int, float] | None = None
@@ -2061,6 +2715,86 @@ class Sam3VideoBase(nn.Module):
         use_presence = os.getenv("SAM3_SPME_FUSION_USE_PRESENCE", "1") == "1"
         use_write_gate = os.getenv("SAM3_SPME_FUSION_USE_WRITE_GATE", "1") == "1"
 
+        # Optional: make fusion event-driven by requiring low tracker confidence.
+        #
+        # Motivation:
+        # - EndoVis experiments show that always-on fusion (applied in ~70% frames) can hurt IoU.
+        # - A more principled "overseer" story is: only inject detector guidance when the tracker is
+        #   uncertain (low tracker_score), i.e., around occlusions / drift recovery windows.
+        #
+        # Envs:
+        # - SAM3_SPME_FUSION_EVENT_DRIVEN=1 enables this behavior.
+        # - SAM3_SPME_FUSION_TRACKER_THR sets the tracker_score threshold (default 0.8).
+        fusion_event_driven = os.getenv("SAM3_SPME_FUSION_EVENT_DRIVEN", "0") == "1"
+        # Event-driven fusion trigger mode:
+        # - tracker_score: trigger when tracker_score < thr (legacy; can miss drift)
+        # - mismatch: trigger when det↔trk IoU < thr (drift-aligned; requires spme_det_trk_iou_by_obj)
+        fusion_event_mode = os.getenv("SAM3_SPME_FUSION_EVENT_MODE", "tracker_score").strip().lower()
+        fusion_tracker_thr = (
+            float(os.getenv("SAM3_SPME_FUSION_TRACKER_THR", "0.8")) if fusion_event_driven else 0.0
+        )
+        fusion_mismatch_iou_thr = (
+            float(os.getenv("SAM3_SPME_FUSION_MISMATCH_IOU_THR", "0.2")) if fusion_event_driven else 0.0
+        )
+        # When using mismatch-triggered event fusion, optionally control whether we further scale the
+        # fusion strength by mismatch severity (lower IoU => stronger).
+        #
+        # - "linear" (default): r *= (thr - miou) / thr
+        # - "hard": do NOT apply extra severity scaling (event is still gated by miou < thr)
+        fusion_mismatch_scale = (
+            os.getenv("SAM3_SPME_FUSION_MISMATCH_SCALE", "linear").strip().lower()
+        )
+
+        # Optional: memory hygiene — skip writing potentially drifted frames into memory.
+        #
+        # Motivation:
+        # - A small number of drift/ghost frames can pollute memory and have long-lasting effects.
+        # - A reviewer-safe safeguard is to *not* write into memory when detector↔tracker consistency
+        #   is low (after det↔trk matching).
+        #
+        # Envs:
+        # - SAM3_SPME_SKIP_WRITE_ON_MISMATCH=1 enables this behavior.
+        # - SAM3_SPME_SKIP_WRITE_MISMATCH_IOU_THR sets the IoU threshold (default: 0.2).
+        #   If unset, defaults to `SAM3_SPME_FUSION_MISMATCH_IOU_THR` when available.
+        # - SAM3_SPME_SKIP_WRITE_MODE controls what to freeze when skipping:
+        #     - "maskmem" (default): freeze only `maskmem_features` (v1 behavior)
+        #     - "full": also freeze `obj_ptr` to keep pointer/memory consistent (v2, recommended)
+        # - SAM3_SPME_SKIP_WRITE_USE_DET_QCOS=1 additionally requires the overseer (detector) to be
+        #   confident and identity-consistent before skipping:
+        #     - det_score_raw >= SAM3_SPME_SKIP_WRITE_DET_THR (default: 0.7)
+        #     - qcos >= SAM3_SPME_SKIP_WRITE_QCOS_THR (default: 0.7)
+        #
+        #   This reduces false skips caused by unreliable detections.
+        skip_write_on_mismatch = os.getenv("SAM3_SPME_SKIP_WRITE_ON_MISMATCH", "0") == "1"
+        skip_write_mismatch_iou_thr = float(
+            os.getenv(
+                "SAM3_SPME_SKIP_WRITE_MISMATCH_IOU_THR",
+                str(fusion_mismatch_iou_thr if fusion_mismatch_iou_thr > 0.0 else 0.2),
+            )
+        )
+        skip_write_mode = os.getenv("SAM3_SPME_SKIP_WRITE_MODE", "maskmem").strip().lower()
+        skip_write_freeze_ptr = skip_write_mode in {"full", "all", "maskmem+ptr", "maskmem_ptr", "ptr"}
+        skip_write_use_det_qcos = os.getenv("SAM3_SPME_SKIP_WRITE_USE_DET_QCOS", "0") == "1"
+        skip_write_det_thr = float(os.getenv("SAM3_SPME_SKIP_WRITE_DET_THR", "0.7"))
+        skip_write_qcos_thr = float(os.getenv("SAM3_SPME_SKIP_WRITE_QCOS_THR", "0.7"))
+
+        # Map tracker confidence to per-object scalars when available.
+        trk_score_by_obj: Dict[int, float] | None = None
+        try:
+            if isinstance(tracker_obj_scores_global, torch.Tensor):
+                obj_ids_all = tracker_metadata.get("obj_ids_all_gpu", None)
+                scores_flat = tracker_obj_scores_global.detach().float().view(-1)
+                if isinstance(obj_ids_all, np.ndarray) and int(obj_ids_all.shape[0]) == int(
+                    scores_flat.shape[0]
+                ):
+                    trk_score_by_obj = {}
+                    for i, obj_id in enumerate(obj_ids_all.astype(np.int64).tolist()):
+                        trk_score_by_obj[int(obj_id)] = float(
+                            scores_flat[int(i)].clamp(0.0, 1.0).item()
+                        )
+        except Exception:
+            trk_score_by_obj = None
+
         def _sigmoid_f(x: float) -> float:
             # Stable sigmoid for floats.
             if x >= 0.0:
@@ -2073,11 +2807,35 @@ class Sam3VideoBase(nn.Module):
             det_score_raw_f: float | None,
             qcos_f: float | None,
             gate_override: float | None = None,
+            tracker_score_f: float | None = None,
+            det_trk_iou_f: float | None = None,
         ) -> tuple[float | None, float | None]:
             if det_score_raw_f is None:
                 return None, None
             if det_score_raw_f < det_thr:
                 return None, None
+            if fusion_event_driven:
+                if fusion_event_mode in {"tracker", "tracker_score", "score"}:
+                    if tracker_score_f is None:
+                        return None, None
+                    # Apply fusion only when tracker confidence is low.
+                    ts = max(0.0, min(1.0, float(tracker_score_f)))
+                    if ts >= fusion_tracker_thr:
+                        return None, None
+                elif fusion_event_mode in {"mismatch", "iou", "det_trk_iou"}:
+                    if det_trk_iou_f is None:
+                        return None, None
+                    miou = max(0.0, min(1.0, float(det_trk_iou_f)))
+                    thr = max(1e-6, float(fusion_mismatch_iou_thr))
+                    if miou >= thr:
+                        return None, None
+                else:
+                    # Unknown mode: fall back to tracker-score behavior.
+                    if tracker_score_f is None:
+                        return None, None
+                    ts = max(0.0, min(1.0, float(tracker_score_f)))
+                    if ts >= fusion_tracker_thr:
+                        return None, None
             r = max(0.0, min(1.0, float(det_score_raw_f)))
             if use_presence and spme_presence_prob is not None:
                 r *= max(0.0, min(1.0, float(spme_presence_prob)))
@@ -2092,6 +2850,27 @@ class Sam3VideoBase(nn.Module):
             if use_write_gate:
                 g = gate_override if gate_override is not None else gate
                 r *= g if g is not None else 1.0
+            if fusion_event_driven:
+                if (
+                    fusion_event_mode in {"tracker", "tracker_score", "score"}
+                    and tracker_score_f is not None
+                    and fusion_tracker_thr > 0.0
+                ):
+                    # Scale more when the tracker is *more* uncertain, but keep this bounded and simple.
+                    ts = max(0.0, min(1.0, float(tracker_score_f)))
+                    r *= max(
+                        0.0,
+                        min(1.0, (fusion_tracker_thr - ts) / max(1e-6, fusion_tracker_thr)),
+                    )
+                elif (
+                    fusion_event_mode in {"mismatch", "iou", "det_trk_iou"}
+                    and det_trk_iou_f is not None
+                    and fusion_mismatch_scale not in {"hard", "none", "off", "0"}
+                ):
+                    # Scale more when mismatch is larger (lower IoU).
+                    miou = max(0.0, min(1.0, float(det_trk_iou_f)))
+                    thr = max(1e-6, float(fusion_mismatch_iou_thr))
+                    r *= max(0.0, min(1.0, (thr - miou) / thr))
             s_mem = float(max(0.0, min(1.0, base_alpha * r))) if base_alpha > 0.0 else 0.0
             s_obj = (
                 float(max(0.0, min(1.0, base_alpha_obj * r))) if base_alpha_obj > 0.0 else 0.0
@@ -2163,6 +2942,7 @@ class Sam3VideoBase(nn.Module):
             ]
             local_batch_size = local_high_res_masks.size(0)
             obj_ids_local = [int(x) for x in tracker_state.get("obj_ids", [])]
+            output_dict = tracker_state["output_dict"]
             learned_gate_mem_scale_1d: Tensor | None = None
             learned_gate_mem_offset_1d: Tensor | None = None
             learned_gate_fusion_1d: Tensor | None = None
@@ -2282,12 +3062,96 @@ class Sam3VideoBase(nn.Module):
                 learned_gate_mem_scale_1d, learned_gate_mem_offset_1d, learned_gate_decay_1d = (
                     self.spme_gate_mlp(x)
                 )
+
+                # Optional inference-time calibration knobs (default: identity).
+                #
+                # Motivation: on some datasets, a learned gate checkpoint can converge to a near-constant
+                # behavior (especially a non-trivial mem_offset), which strongly suppresses ghosts but
+                # can also harm mask quality on GT-present frames. These scalars allow quick, reproducible
+                # sweeps without retraining to localize the culprit term(s).
+                def _get_float_env(name: str, default: float) -> float:
+                    try:
+                        return float(os.getenv(name, str(default)))
+                    except Exception:
+                        return float(default)
+
+                write_strength = _get_float_env("SAM3_SPME_LEARNED_GATE_WRITE_STRENGTH", 1.0)
+                offset_strength = _get_float_env("SAM3_SPME_LEARNED_GATE_OFFSET_STRENGTH", 1.0)
+                decay_strength = _get_float_env("SAM3_SPME_LEARNED_GATE_DECAY_STRENGTH", 1.0)
+
+                if write_strength != 1.0:
+                    learned_gate_mem_scale_1d = (learned_gate_mem_scale_1d * float(write_strength)).clamp(
+                        0.0, 1.0
+                    )
+                if offset_strength != 1.0:
+                    learned_gate_mem_offset_1d = learned_gate_mem_offset_1d * float(offset_strength)
+                if decay_strength != 1.0:
+                    learned_gate_decay_1d = (learned_gate_decay_1d * float(decay_strength)).clamp(
+                        0.0, 1.0
+                    )
+
+                # Optional: enforce a detector-confidence monotonicity constraint at inference time.
+                #
+                # Rationale:
+                # - On some runs, the learned gate can converge to near-constant mem_offset/mem_scale that
+                #   suppresses ghosts, but also degrades mask quality on GT-present frames.
+                # - We can make the behavior more interpretable and safer by modulating *how much* the gate
+                #   deviates from identity based on per-object detector confidence: when det_score is high,
+                #   push (scale→1, offset→0, decay→0); when det_score is low, allow the learned edit.
+                #
+                # This is strictly inference-time and does not change checkpoint formats.
+                if os.getenv("SAM3_SPME_LEARNED_GATE_MODULATE_BY_DET", "0") == "1":
+                    det_pow = _get_float_env("SAM3_SPME_LEARNED_GATE_MODULATE_BY_DET_POW", 1.0)
+
+                    # Base confidence proxy: detector score.
+                    conf_t = det_t
+
+                    # Optional: incorporate qcos consistency so that the gate can still intervene when
+                    # det_score is high but inconsistent (e.g., false positives / drift signatures).
+                    #
+                    # This reuses the fusion qcos gate knobs for simplicity/consistency:
+                    # - SAM3_SPME_FUSION_QCOS_THR
+                    # - SAM3_SPME_FUSION_QCOS_TEMP
+                    # - SAM3_SPME_FUSION_QCOS_GATE in {sigmoid, linear}
+                    if os.getenv("SAM3_SPME_LEARNED_GATE_MODULATE_BY_DET_USE_QCOS", "0") == "1":
+                        q_thr_m = float(os.getenv("SAM3_SPME_FUSION_QCOS_THR", "0.0"))
+                        q_temp_m = float(os.getenv("SAM3_SPME_FUSION_QCOS_TEMP", "20.0"))
+                        q_gate_m = os.getenv("SAM3_SPME_FUSION_QCOS_GATE", "sigmoid").strip().lower()
+
+                        def _sigmoid_t(x: torch.Tensor) -> torch.Tensor:
+                            return 0.5 * (torch.tanh(x * 0.5) + 1.0)
+
+                        if q_gate_m == "sigmoid":
+                            q_gate_val = _sigmoid_t((qcos_t - float(q_thr_m)) * float(q_temp_m))
+                        else:
+                            denom = max(1e-6, 1.0 - float(q_thr_m))
+                            q_gate_val = ((qcos_t - float(q_thr_m)) / denom).clamp(0.0, 1.0)
+
+                        conf_t = (conf_t * q_gate_val).clamp(0.0, 1.0)
+
+                    abs_w = (1.0 - conf_t).clamp(0.0, 1.0)
+                    if det_pow != 1.0:
+                        abs_w = abs_w.pow(float(det_pow))
+
+                    abs_w_mem = abs_w.unsqueeze(-1)  # (N,1) for broadcasting
+                    learned_gate_mem_scale_1d = 1.0 - (1.0 - learned_gate_mem_scale_1d) * abs_w_mem
+                    learned_gate_mem_offset_1d = learned_gate_mem_offset_1d * abs_w_mem
+                    if learned_gate_use_decay:
+                        learned_gate_decay_1d = learned_gate_decay_1d * abs_w_mem[:, :1]
+
                 if isinstance(self.spme_gate_fusion_mlp, nn.Module):
                     learned_gate_fusion_1d = torch.sigmoid(
                         self.spme_gate_fusion_mlp(x.to(dtype=torch.float32))
                     )
                 else:
                     learned_gate_fusion_1d = learned_gate_mem_scale_1d.mean(dim=-1, keepdim=True)
+
+                fusion_strength = _get_float_env("SAM3_SPME_LEARNED_GATE_FUSION_STRENGTH", 1.0)
+                if fusion_strength != 1.0 and learned_gate_fusion_1d is not None:
+                    learned_gate_fusion_1d = (learned_gate_fusion_1d * float(fusion_strength)).clamp(
+                        0.0, 1.0
+                    )
+
                 if not learned_gate_use_decay:
                     learned_gate_decay_1d = learned_gate_decay_1d * 0.0
 
@@ -2456,33 +3320,35 @@ class Sam3VideoBase(nn.Module):
                         if not isinstance(qv_src, torch.Tensor) or qv_src.numel() == 0:
                             continue
                         det_score_f = spme_det_score_raw_by_obj.get(obj_id, None)
+                        trk_score_f = (
+                            float(trk_score_by_obj.get(obj_id))
+                            if isinstance(trk_score_by_obj, dict) and obj_id in trk_score_by_obj
+                            else None
+                        )
                         qcos_f = (
                             spme_query_cos_by_obj.get(obj_id, None)
                             if isinstance(spme_query_cos_by_obj, dict)
                             else None
                         )
-                        if learned_gate_enabled and learned_gate_fusion_1d is not None:
-                            det_score_ff = float(det_score_f) if det_score_f is not None else 0.0
-                            if det_thr > 0.0 and det_score_ff < det_thr:
-                                continue
-                            scale_mem = (
-                                torch.clamp(
-                                    learned_gate_fusion_1d[j : j + 1] * float(base_alpha), 0.0, 1.0
-                                )
-                                if base_alpha > 0.0
-                                else None
-                            )
-                            if scale_mem is None or float(scale_mem.detach().item()) <= 0.0:
-                                continue
-                        else:
-                            gate_override = (
-                                gate_by_obj.get(obj_id, None) if gate_by_obj is not None else None
-                            )
-                            s_mem, s_obj = _fusion_scales_for_one(
-                                det_score_f, qcos_f, gate_override=gate_override
-                            )
-                            if s_mem is None:
-                                continue
+                        det_trk_iou_f = (
+                            spme_det_trk_iou_by_obj.get(obj_id, None)
+                            if isinstance(spme_det_trk_iou_by_obj, dict)
+                            else None
+                        )
+                        gate_override = (
+                            float(learned_gate_fusion_1d[j].detach().float().item())
+                            if (learned_gate_enabled and learned_gate_fusion_1d is not None)
+                            else (gate_by_obj.get(obj_id, None) if gate_by_obj is not None else None)
+                        )
+                        s_mem, s_obj = _fusion_scales_for_one(
+                            det_score_f,
+                            qcos_f,
+                            gate_override=gate_override,
+                            tracker_score_f=trk_score_f,
+                            det_trk_iou_f=det_trk_iou_f,
+                        )
+                        if s_mem is None:
+                            continue
 
                         qv = qv_src.detach()
                         if qv.ndim > 1:
@@ -2496,14 +3362,7 @@ class Sam3VideoBase(nn.Module):
                             gamma, beta = film[:, :mem_dim], film[:, mem_dim:]
                             gamma = torch.tanh(gamma).to(local_maskmem_features.dtype)
                             beta = torch.tanh(beta).to(local_maskmem_features.dtype)
-                            if learned_gate_enabled and learned_gate_fusion_1d is not None:
-                                scale_t = scale_mem.to(dtype=local_maskmem_features.dtype).view(
-                                    1, 1, 1, 1
-                                )
-                            else:
-                                scale_t = local_maskmem_features.new_tensor(float(s_mem)).view(
-                                    1, 1, 1, 1
-                                )
+                            scale_t = local_maskmem_features.new_tensor(float(s_mem)).view(1, 1, 1, 1)
                             local_maskmem_features[j : j + 1] = local_maskmem_features[j : j + 1] * (
                                 1.0 + gamma.view(1, mem_dim, 1, 1) * scale_t
                             ) + beta.view(1, mem_dim, 1, 1) * scale_t
@@ -2524,14 +3383,7 @@ class Sam3VideoBase(nn.Module):
                                 device=local_maskmem_features.device,
                                 dtype=local_maskmem_features.dtype,
                             )
-                            if learned_gate_enabled and learned_gate_fusion_1d is not None:
-                                scale_t = scale_mem.to(dtype=local_maskmem_features.dtype).view(
-                                    1, 1, 1, 1
-                                )
-                            else:
-                                scale_t = local_maskmem_features.new_tensor(float(s_mem)).view(
-                                    1, 1, 1, 1
-                                )
+                            scale_t = local_maskmem_features.new_tensor(float(s_mem)).view(1, 1, 1, 1)
                             local_maskmem_features[j : j + 1] = local_maskmem_features[
                                 j : j + 1
                             ] + q_mem.view(1, mem_dim, 1, 1) * scale_t
@@ -2546,70 +3398,100 @@ class Sam3VideoBase(nn.Module):
                         and isinstance(spme_query_vec, torch.Tensor)
                         and spme_query_vec.numel() > 0
                         and spme_det_score_raw is not None
-                        and base_alpha > 0.0
                     ):
-                        det_score_ff = float(spme_det_score_raw)
-                        if det_thr > 0.0 and det_score_ff < det_thr:
-                            pass
-                        else:
-                            qv = spme_query_vec.detach()
-                            if qv.ndim > 1:
-                                qv = qv.reshape(-1)
-                            qv = qv.to(device=local_maskmem_features.device, dtype=torch.float32)
-                            qv = qv / qv.norm().clamp_min(1e-6)
-                            qv = qv.view(1, -1)  # (1, D)
+                        # Use the same safety-gated fusion scaling as the heuristic path, but
+                        # override the write-gate term with the learned fusion head output.
+                        qv = spme_query_vec.detach()
+                        if qv.ndim > 1:
+                            qv = qv.reshape(-1)
+                        qv = qv.to(device=local_maskmem_features.device, dtype=torch.float32)
+                        qv = qv / qv.norm().clamp_min(1e-6)
+                        qv = qv.view(1, -1)  # (1, D)
 
-                            if fusion_mode in {"film", "filmedit"}:
-                                film = self.spme_fusion_mem_film_mlp(qv)
-                                gamma, beta = film[:, :mem_dim], film[:, mem_dim:]
-                                gamma = torch.tanh(gamma).to(local_maskmem_features.dtype)
-                                beta = torch.tanh(beta).to(local_maskmem_features.dtype)
-                                for j in range(int(local_batch_size)):
-                                    scale_mem = torch.clamp(
-                                        learned_gate_fusion_1d[j : j + 1] * float(base_alpha),
-                                        0.0,
-                                        1.0,
-                                    )
-                                    if float(scale_mem.detach().item()) <= 0.0:
-                                        continue
-                                    scale_t = scale_mem.to(dtype=local_maskmem_features.dtype).view(
-                                        1, 1, 1, 1
-                                    )
-                                    local_maskmem_features[j : j + 1] = local_maskmem_features[
-                                        j : j + 1
-                                    ] * (1.0 + gamma.view(1, mem_dim, 1, 1) * scale_t) + beta.view(
-                                        1, mem_dim, 1, 1
-                                    ) * scale_t
-                            else:
-                                if int(qv.shape[1]) == mem_dim:
-                                    q_mem = qv
-                                else:
-                                    proj = getattr(self.tracker, "obj_ptr_tpos_proj", None)
-                                    if isinstance(proj, nn.Module):
-                                        q_mem = proj(qv)
-                                    else:
-                                        q_mem = qv[:, :mem_dim]
-                                        if int(q_mem.shape[1]) < mem_dim:
-                                            q_mem = F.pad(q_mem, (0, mem_dim - int(q_mem.shape[1])))
-                                q_mem = q_mem.to(
-                                    device=local_maskmem_features.device,
-                                    dtype=local_maskmem_features.dtype,
+                        qcos_global = (
+                            None
+                            if (spme_query_cos is None or math.isnan(float(spme_query_cos)))
+                            else float(spme_query_cos)
+                        )
+                        det_score_global = float(spme_det_score_raw)
+
+                        if fusion_mode in {"film", "filmedit"}:
+                            film = self.spme_fusion_mem_film_mlp(qv)
+                            gamma, beta = film[:, :mem_dim], film[:, mem_dim:]
+                            gamma = torch.tanh(gamma).to(local_maskmem_features.dtype)
+                            beta = torch.tanh(beta).to(local_maskmem_features.dtype)
+                            for j in range(int(local_batch_size)):
+                                gate_override = float(
+                                    learned_gate_fusion_1d[j].detach().float().item()
                                 )
-                                resid = q_mem.view(1, mem_dim, 1, 1)
-                                for j in range(int(local_batch_size)):
-                                    scale_mem = torch.clamp(
-                                        learned_gate_fusion_1d[j : j + 1] * float(base_alpha),
-                                        0.0,
-                                        1.0,
-                                    )
-                                    if float(scale_mem.detach().item()) <= 0.0:
-                                        continue
-                                    scale_t = scale_mem.to(dtype=local_maskmem_features.dtype).view(
-                                        1, 1, 1, 1
-                                    )
-                                    local_maskmem_features[j : j + 1] = local_maskmem_features[
-                                        j : j + 1
-                                    ] + resid * scale_t
+                                trk_score_f = None
+                                if (
+                                    isinstance(trk_score_by_obj, dict)
+                                    and isinstance(obj_ids_local, list)
+                                    and j < len(obj_ids_local)
+                                ):
+                                    oid = int(obj_ids_local[j])
+                                    if oid in trk_score_by_obj:
+                                        trk_score_f = float(trk_score_by_obj.get(oid))
+                                s_mem, _ = _fusion_scales_for_one(
+                                    det_score_global,
+                                    qcos_global,
+                                    gate_override=gate_override,
+                                    tracker_score_f=trk_score_f,
+                                )
+                                if s_mem is None:
+                                    continue
+                                scale_t = local_maskmem_features.new_tensor(float(s_mem)).view(
+                                    1, 1, 1, 1
+                                )
+                                local_maskmem_features[j : j + 1] = local_maskmem_features[
+                                    j : j + 1
+                                ] * (1.0 + gamma.view(1, mem_dim, 1, 1) * scale_t) + beta.view(
+                                    1, mem_dim, 1, 1
+                                ) * scale_t
+                        else:
+                            if int(qv.shape[1]) == mem_dim:
+                                q_mem = qv
+                            else:
+                                proj = getattr(self.tracker, "obj_ptr_tpos_proj", None)
+                                if isinstance(proj, nn.Module):
+                                    q_mem = proj(qv)
+                                else:
+                                    q_mem = qv[:, :mem_dim]
+                                    if int(q_mem.shape[1]) < mem_dim:
+                                        q_mem = F.pad(q_mem, (0, mem_dim - int(q_mem.shape[1])))
+                            q_mem = q_mem.to(
+                                device=local_maskmem_features.device,
+                                dtype=local_maskmem_features.dtype,
+                            )
+                            resid = q_mem.view(1, mem_dim, 1, 1)
+                            for j in range(int(local_batch_size)):
+                                gate_override = float(
+                                    learned_gate_fusion_1d[j].detach().float().item()
+                                )
+                                trk_score_f = None
+                                if (
+                                    isinstance(trk_score_by_obj, dict)
+                                    and isinstance(obj_ids_local, list)
+                                    and j < len(obj_ids_local)
+                                ):
+                                    oid = int(obj_ids_local[j])
+                                    if oid in trk_score_by_obj:
+                                        trk_score_f = float(trk_score_by_obj.get(oid))
+                                s_mem, _ = _fusion_scales_for_one(
+                                    det_score_global,
+                                    qcos_global,
+                                    gate_override=gate_override,
+                                    tracker_score_f=trk_score_f,
+                                )
+                                if s_mem is None:
+                                    continue
+                                scale_t = local_maskmem_features.new_tensor(float(s_mem)).view(
+                                    1, 1, 1, 1
+                                )
+                                local_maskmem_features[j : j + 1] = local_maskmem_features[
+                                    j : j + 1
+                                ] + resid * scale_t
                     else:
                         fusion_scale_mem: float | None = None
                         fusion_scale_obj: float | None = None
@@ -2618,9 +3500,18 @@ class Sam3VideoBase(nn.Module):
                             and spme_query_vec.numel() > 0
                             and spme_det_score_raw is not None
                         ):
+                            trk_score_f = None
+                            if isinstance(trk_score_by_obj, dict):
+                                try:
+                                    obj_ids_local = [int(x) for x in tracker_state.get("obj_ids", [])]
+                                    if obj_ids_local and int(obj_ids_local[0]) in trk_score_by_obj:
+                                        trk_score_f = float(trk_score_by_obj.get(int(obj_ids_local[0])))
+                                except Exception:
+                                    trk_score_f = None
                             fusion_scale_mem, fusion_scale_obj = _fusion_scales_for_one(
                                 float(spme_det_score_raw),
                                 float(spme_query_cos) if spme_query_cos is not None else None,
+                                tracker_score_f=trk_score_f,
                             )
                         if (fusion_scale_mem is not None or fusion_scale_obj is not None) and isinstance(
                             spme_query_vec, torch.Tensor
@@ -2663,8 +3554,69 @@ class Sam3VideoBase(nn.Module):
                                     local_maskmem_features = local_maskmem_features + resid * float(
                                         fusion_scale_mem
                                     )
+
+            # Optional: hard "do not write" on mismatch frames (memory hygiene).
+            #
+            # This is applied after learned-gate and fusion edits, so it cleanly overrides any write.
+            # We only trigger when det↔trk IoU is available and below threshold; missing/NaN IoU does
+            # not trigger skipping by default (conservative).
+            spme_skip_write_1d: torch.Tensor | None = None
+            spme_skip_write_flags: list[float] | None = None
+            if skip_write_on_mismatch and isinstance(spme_det_trk_iou_by_obj, dict) and obj_ids_local:
+                thr = max(1e-6, float(skip_write_mismatch_iou_thr))
+                skip_flags: list[float] = []
+                for obj_id in obj_ids_local:
+                    v = spme_det_trk_iou_by_obj.get(int(obj_id), None)
+                    try:
+                        miou = float(v) if v is not None else float("nan")
+                    except Exception:
+                        miou = float("nan")
+                    do_skip = (not math.isnan(miou)) and (miou < thr)
+                    if do_skip and skip_write_use_det_qcos:
+                        # Require a reliable overseer signal before skipping writes.
+                        det_f = (
+                            float(spme_det_score_raw_by_obj.get(obj_id))
+                            if isinstance(spme_det_score_raw_by_obj, dict)
+                            and obj_id in spme_det_score_raw_by_obj
+                            else (float(spme_det_score_raw) if spme_det_score_raw is not None else float("nan"))
+                        )
+                        qcos_f = (
+                            float(spme_query_cos_by_obj.get(obj_id))
+                            if isinstance(spme_query_cos_by_obj, dict)
+                            and obj_id in spme_query_cos_by_obj
+                            else (float(spme_query_cos) if spme_query_cos is not None else float("nan"))
+                        )
+                        det_ok = (not math.isnan(det_f)) and (det_f >= float(skip_write_det_thr))
+                        q_ok = (not math.isnan(qcos_f)) and (qcos_f >= float(skip_write_qcos_thr))
+                        do_skip = bool(det_ok and q_ok)
+                    skip_flags.append(1.0 if do_skip else 0.0)
+
+                if any(x > 0.0 for x in skip_flags):
+                    prev_frame_idx = frame_idx + 1 if track_in_reverse else frame_idx - 1
+                    prev_out = None
+                    if prev_frame_idx >= 0:
+                        prev_out = output_dict["non_cond_frame_outputs"].get(prev_frame_idx, None)
+                        if prev_out is None:
+                            prev_out = output_dict["cond_frame_outputs"].get(prev_frame_idx, None)
+                    if isinstance(prev_out, dict):
+                        prev_feat = prev_out.get("maskmem_features", None)
+                        if (
+                            isinstance(prev_feat, torch.Tensor)
+                            and prev_feat.shape == local_maskmem_features.shape
+                        ):
+                            prev_feat = prev_feat.to(
+                                device=local_maskmem_features.device,
+                                dtype=local_maskmem_features.dtype,
+                            )
+                            for j, sf in enumerate(skip_flags):
+                                if sf > 0.0:
+                                    local_maskmem_features[j : j + 1] = prev_feat[j : j + 1]
+
+                spme_skip_write_1d = torch.tensor(
+                    skip_flags, dtype=torch.float32, device=torch.device("cpu")
+                ).view(-1, 1)
+                spme_skip_write_flags = skip_flags
             # Store encoded memories in the local inference state
-            output_dict = tracker_state["output_dict"]
             for storage_key in ["cond_frame_outputs", "non_cond_frame_outputs"]:
                 if frame_idx not in output_dict[storage_key]:
                     continue
@@ -2674,6 +3626,8 @@ class Sam3VideoBase(nn.Module):
                 output_dict[storage_key][frame_idx]["maskmem_pos_enc"] = [
                     pos for pos in local_maskmem_pos_enc
                 ]
+                if spme_skip_write_1d is not None:
+                    output_dict[storage_key][frame_idx]["spme_skip_write"] = spme_skip_write_1d
                 if (
                     learned_gate_log_to_out
                     and learned_gate_mem_scale_1d is not None
@@ -2697,6 +3651,171 @@ class Sam3VideoBase(nn.Module):
                     output_dict[storage_key][frame_idx]["spme_gate_decay"] = (
                         learned_gate_decay_1d.detach().float().cpu()
                     )
+                # Optionally log SPME detector/pointer signals and effective fusion scales.
+                if signals_log_to_out:
+                    try:
+                        # Per-object det_score/qcos (or fall back to global).
+                        det_vals_out: list[float] = []
+                        qcos_vals_out: list[float] = []
+                        presence_vals_out: list[float] = []
+                        iou_vals_out: list[float] = []
+                        reinit_vals_out: list[float] = []
+                        reid_best_sim_vals_out: list[float] = []
+                        reid_margin_vals_out: list[float] = []
+                        reid_accept_vals_out: list[float] = []
+                        reid_bank_size_vals_out: list[float] = []
+                        for obj_id in obj_ids_local:
+                            det_f = (
+                                float(spme_det_score_raw_by_obj.get(obj_id))
+                                if isinstance(spme_det_score_raw_by_obj, dict)
+                                and obj_id in spme_det_score_raw_by_obj
+                                else (float(spme_det_score_raw) if spme_det_score_raw is not None else float("nan"))
+                            )
+                            qcos_f = (
+                                float(spme_query_cos_by_obj.get(obj_id))
+                                if isinstance(spme_query_cos_by_obj, dict)
+                                and obj_id in spme_query_cos_by_obj
+                                else (float(spme_query_cos) if spme_query_cos is not None else float("nan"))
+                            )
+                            det_vals_out.append(det_f)
+                            qcos_vals_out.append(qcos_f)
+                            presence_vals_out.append(
+                                float(spme_presence_prob) if spme_presence_prob is not None else float("nan")
+                            )
+                            iou_vals_out.append(
+                                float(spme_det_trk_iou_by_obj.get(obj_id))
+                                if isinstance(spme_det_trk_iou_by_obj, dict)
+                                and obj_id in spme_det_trk_iou_by_obj
+                                else float("nan")
+                            )
+                            reinit_vals_out.append(
+                                1.0
+                                if isinstance(spme_reinit_by_obj, dict) and int(obj_id) in spme_reinit_by_obj
+                                else 0.0
+                            )
+                            reid_best_sim_vals_out.append(
+                                float(spme_reid_best_sim_by_obj.get(obj_id))
+                                if isinstance(spme_reid_best_sim_by_obj, dict)
+                                and int(obj_id) in spme_reid_best_sim_by_obj
+                                else float("nan")
+                            )
+                            reid_margin_vals_out.append(
+                                float(spme_reid_margin_by_obj.get(obj_id))
+                                if isinstance(spme_reid_margin_by_obj, dict)
+                                and int(obj_id) in spme_reid_margin_by_obj
+                                else float("nan")
+                            )
+                            reid_accept_vals_out.append(
+                                1.0
+                                if isinstance(spme_reid_accept_by_obj, dict)
+                                and int(spme_reid_accept_by_obj.get(int(obj_id), 0)) > 0
+                                else 0.0
+                            )
+                            reid_bank_size_vals_out.append(
+                                float(spme_reid_bank_size_by_obj.get(obj_id))
+                                if isinstance(spme_reid_bank_size_by_obj, dict)
+                                and int(obj_id) in spme_reid_bank_size_by_obj
+                                else float("nan")
+                            )
+
+                        output_dict[storage_key][frame_idx]["spme_det_score_raw"] = (
+                            torch.tensor(det_vals_out, dtype=torch.float32).view(-1, 1).cpu()
+                        )
+                        output_dict[storage_key][frame_idx]["spme_query_cos"] = (
+                            torch.tensor(qcos_vals_out, dtype=torch.float32).view(-1, 1).cpu()
+                        )
+                        output_dict[storage_key][frame_idx]["spme_presence_prob"] = (
+                            torch.tensor(presence_vals_out, dtype=torch.float32).view(-1, 1).cpu()
+                        )
+                        output_dict[storage_key][frame_idx]["spme_det_trk_iou"] = (
+                            torch.tensor(iou_vals_out, dtype=torch.float32).view(-1, 1).cpu()
+                        )
+                        output_dict[storage_key][frame_idx]["spme_reinit"] = (
+                            torch.tensor(reinit_vals_out, dtype=torch.float32).view(-1, 1).cpu()
+                        )
+                        output_dict[storage_key][frame_idx]["spme_reid_best_sim"] = (
+                            torch.tensor(reid_best_sim_vals_out, dtype=torch.float32).view(-1, 1).cpu()
+                        )
+                        output_dict[storage_key][frame_idx]["spme_reid_margin"] = (
+                            torch.tensor(reid_margin_vals_out, dtype=torch.float32).view(-1, 1).cpu()
+                        )
+                        output_dict[storage_key][frame_idx]["spme_reid_accept"] = (
+                            torch.tensor(reid_accept_vals_out, dtype=torch.float32).view(-1, 1).cpu()
+                        )
+                        output_dict[storage_key][frame_idx]["spme_reid_bank_size"] = (
+                            torch.tensor(reid_bank_size_vals_out, dtype=torch.float32).view(-1, 1).cpu()
+                        )
+
+                        if fusion_enabled and (base_alpha > 0.0 or base_alpha_obj > 0.0):
+                            scale_mem_vals: list[float] = []
+                            scale_obj_vals: list[float] = []
+
+                            per_obj_ctx_ok = (
+                                fusion_per_object
+                                and isinstance(spme_query_vec_by_obj, dict)
+                                and isinstance(spme_det_score_raw_by_obj, dict)
+                                and len(spme_query_vec_by_obj) > 0
+                                and len(spme_det_score_raw_by_obj) > 0
+                            )
+                            do_global_fusion = (not fusion_per_object) or (
+                                fusion_per_object_fallback and (not per_obj_ctx_ok)
+                            )
+
+                            for j, obj_id in enumerate(obj_ids_local):
+                                has_ptr = False
+                                if per_obj_ctx_ok:
+                                    qv_src = spme_query_vec_by_obj.get(obj_id, None)
+                                    has_ptr = isinstance(qv_src, torch.Tensor) and qv_src.numel() > 0
+                                elif do_global_fusion:
+                                    has_ptr = (
+                                        isinstance(spme_query_vec, torch.Tensor) and spme_query_vec.numel() > 0
+                                    )
+
+                                det_f = det_vals_out[j]
+                                qcos_f = qcos_vals_out[j]
+                                iou_f = iou_vals_out[j] if j < len(iou_vals_out) else float("nan")
+                                trk_score_f = (
+                                    float(trk_score_by_obj.get(obj_id))
+                                    if isinstance(trk_score_by_obj, dict) and obj_id in trk_score_by_obj
+                                    else None
+                                )
+
+                                s_mem = 0.0
+                                s_obj = 0.0
+                                if has_ptr and not (math.isnan(det_f) or det_f is None):
+                                    gate_override = (
+                                        float(learned_gate_fusion_1d[j].detach().float().item())
+                                        if (learned_gate_enabled and learned_gate_fusion_1d is not None)
+                                        else (
+                                            gate_by_obj.get(obj_id, None) if gate_by_obj is not None else None
+                                        )
+                                    )
+                                    sm, so = _fusion_scales_for_one(
+                                        float(det_f),
+                                        None if (qcos_f is None or math.isnan(float(qcos_f))) else float(qcos_f),
+                                        gate_override=gate_override,
+                                        tracker_score_f=trk_score_f,
+                                        det_trk_iou_f=(
+                                            None
+                                            if (iou_f is None or math.isnan(float(iou_f)))
+                                            else float(iou_f)
+                                        ),
+                                    )
+                                    s_mem = float(sm) if sm is not None else 0.0
+                                    s_obj = float(so) if so is not None else 0.0
+
+                                scale_mem_vals.append(float(s_mem))
+                                scale_obj_vals.append(float(s_obj))
+
+                            output_dict[storage_key][frame_idx]["spme_fusion_scale_mem"] = (
+                                torch.tensor(scale_mem_vals, dtype=torch.float32).view(-1, 1).cpu()
+                            )
+                            output_dict[storage_key][frame_idx]["spme_fusion_scale_obj"] = (
+                                torch.tensor(scale_obj_vals, dtype=torch.float32).view(-1, 1).cpu()
+                            )
+                    except Exception:
+                        # Best-effort logging; never affect inference.
+                        pass
                 # Apply obj_ptr edits.
                 if fusion_enabled and base_alpha_obj > 0.0:
                     obj_ptr = output_dict[storage_key][frame_idx].get("obj_ptr", None)
@@ -2719,31 +3838,37 @@ class Sam3VideoBase(nn.Module):
                                 if not isinstance(qv_src, torch.Tensor) or qv_src.numel() == 0:
                                     continue
                                 det_score_f = spme_det_score_raw_by_obj.get(obj_id, None)
+                                trk_score_f = (
+                                    float(trk_score_by_obj.get(obj_id))
+                                    if isinstance(trk_score_by_obj, dict) and obj_id in trk_score_by_obj
+                                    else None
+                                )
                                 qcos_f = (
                                     spme_query_cos_by_obj.get(obj_id, None)
                                     if isinstance(spme_query_cos_by_obj, dict)
                                     else None
                                 )
-                                if learned_gate_enabled and learned_gate_fusion_1d is not None:
-                                    det_score_ff = float(det_score_f) if det_score_f is not None else 0.0
-                                    if det_thr > 0.0 and det_score_ff < det_thr:
-                                        continue
-                                    scale_obj = torch.clamp(
-                                        learned_gate_fusion_1d[j : j + 1] * float(base_alpha_obj),
-                                        0.0,
-                                        1.0,
-                                    )
-                                    if float(scale_obj.detach().item()) <= 0.0:
-                                        continue
-                                else:
-                                    gate_override = (
+                                det_trk_iou_f = (
+                                    spme_det_trk_iou_by_obj.get(obj_id, None)
+                                    if isinstance(spme_det_trk_iou_by_obj, dict)
+                                    else None
+                                )
+                                gate_override = (
+                                    float(learned_gate_fusion_1d[j].detach().float().item())
+                                    if (learned_gate_enabled and learned_gate_fusion_1d is not None)
+                                    else (
                                         gate_by_obj.get(obj_id, None) if gate_by_obj is not None else None
                                     )
-                                    _, s_obj = _fusion_scales_for_one(
-                                        det_score_f, qcos_f, gate_override=gate_override
-                                    )
-                                    if s_obj is None:
-                                        continue
+                                )
+                                _, s_obj = _fusion_scales_for_one(
+                                    det_score_f,
+                                    qcos_f,
+                                    gate_override=gate_override,
+                                    tracker_score_f=trk_score_f,
+                                    det_trk_iou_f=det_trk_iou_f,
+                                )
+                                if s_obj is None:
+                                    continue
                                 qv = qv_src.detach()
                                 if qv.ndim > 1:
                                     qv = qv.reshape(-1)
@@ -2753,12 +3878,7 @@ class Sam3VideoBase(nn.Module):
                                 delta = self.spme_fusion_obj_ptr_mlp(qv).to(
                                     device=obj_ptr.device, dtype=obj_ptr.dtype
                                 )
-                                if learned_gate_enabled and learned_gate_fusion_1d is not None:
-                                    obj_ptr[j : j + 1] = obj_ptr[j : j + 1] + delta * scale_obj.to(
-                                        dtype=obj_ptr.dtype
-                                    )
-                                else:
-                                    obj_ptr[j : j + 1] = obj_ptr[j : j + 1] + delta * float(s_obj)
+                                obj_ptr[j : j + 1] = obj_ptr[j : j + 1] + delta * float(s_obj)
                             output_dict[storage_key][frame_idx]["obj_ptr"] = obj_ptr
 
                         if do_global_obj_edit:
@@ -2769,40 +3889,67 @@ class Sam3VideoBase(nn.Module):
                                 and spme_query_vec.numel() > 0
                                 and spme_det_score_raw is not None
                             ):
-                                det_score_ff = float(spme_det_score_raw)
-                                if det_thr > 0.0 and det_score_ff < det_thr:
-                                    pass
-                                else:
-                                    qv = spme_query_vec.detach()
-                                    if qv.ndim > 1:
-                                        qv = qv.reshape(-1)
-                                    qv = qv.to(device=obj_ptr.device, dtype=torch.float32)
-                                    qv = qv / qv.norm().clamp_min(1e-6)
-                                    qv = qv.view(1, -1)
-                                    delta = self.spme_fusion_obj_ptr_mlp(qv).to(
-                                        device=obj_ptr.device, dtype=obj_ptr.dtype
+                                qv = spme_query_vec.detach()
+                                if qv.ndim > 1:
+                                    qv = qv.reshape(-1)
+                                qv = qv.to(device=obj_ptr.device, dtype=torch.float32)
+                                qv = qv / qv.norm().clamp_min(1e-6)
+                                qv = qv.view(1, -1)
+                                delta = self.spme_fusion_obj_ptr_mlp(qv).to(
+                                    device=obj_ptr.device, dtype=obj_ptr.dtype
+                                )
+
+                                qcos_global = (
+                                    None
+                                    if (spme_query_cos is None or math.isnan(float(spme_query_cos)))
+                                    else float(spme_query_cos)
+                                )
+                                det_score_global = float(spme_det_score_raw)
+                                for j in range(int(obj_ptr.shape[0])):
+                                    gate_override = float(
+                                        learned_gate_fusion_1d[j].detach().float().item()
                                     )
-                                    for j in range(int(obj_ptr.shape[0])):
-                                        scale_obj = torch.clamp(
-                                            learned_gate_fusion_1d[j : j + 1] * float(base_alpha_obj),
-                                            0.0,
-                                            1.0,
-                                        )
-                                        if float(scale_obj.detach().item()) <= 0.0:
-                                            continue
-                                        obj_ptr[j : j + 1] = obj_ptr[j : j + 1] + delta * scale_obj.to(
-                                            dtype=obj_ptr.dtype
-                                        )
-                                    output_dict[storage_key][frame_idx]["obj_ptr"] = obj_ptr
+                                    trk_score_f = None
+                                    if (
+                                        isinstance(trk_score_by_obj, dict)
+                                        and isinstance(obj_ids_local, list)
+                                        and j < len(obj_ids_local)
+                                    ):
+                                        oid = int(obj_ids_local[j])
+                                        if oid in trk_score_by_obj:
+                                            trk_score_f = float(trk_score_by_obj.get(oid))
+                                    _, s_obj = _fusion_scales_for_one(
+                                        det_score_global,
+                                        qcos_global,
+                                        gate_override=gate_override,
+                                        tracker_score_f=trk_score_f,
+                                    )
+                                    if s_obj is None:
+                                        continue
+                                    obj_ptr[j : j + 1] = obj_ptr[j : j + 1] + delta * float(s_obj)
+                                output_dict[storage_key][frame_idx]["obj_ptr"] = obj_ptr
                             else:
                                 if (
                                     isinstance(spme_query_vec, torch.Tensor)
                                     and spme_query_vec.numel() > 0
                                     and spme_det_score_raw is not None
                                 ):
+                                    trk_score_f = None
+                                    if isinstance(trk_score_by_obj, dict):
+                                        try:
+                                            obj_ids_local = [
+                                                int(x) for x in tracker_state.get("obj_ids", [])
+                                            ]
+                                            if obj_ids_local and int(obj_ids_local[0]) in trk_score_by_obj:
+                                                trk_score_f = float(
+                                                    trk_score_by_obj.get(int(obj_ids_local[0]))
+                                                )
+                                        except Exception:
+                                            trk_score_f = None
                                     _, s_obj = _fusion_scales_for_one(
                                         float(spme_det_score_raw),
                                         float(spme_query_cos) if spme_query_cos is not None else None,
+                                        tracker_score_f=trk_score_f,
                                     )
                                     if s_obj is not None:
                                         qv = spme_query_vec.detach()
@@ -2875,6 +4022,44 @@ class Sam3VideoBase(nn.Module):
                                     output_dict[storage_key][frame_idx]["obj_ptr"] = (
                                         curr_ptr * gate_ptr + prev_ptr * (1.0 - gate_ptr)
                                     )
+
+                # Keep pointer/memory consistent on skip-write frames (v2).
+                #
+                # NOTE: Skip-write overrides any fusion edits and blending, so it behaves as a strict
+                # "do not write" policy. This is only enabled when SAM3_SPME_SKIP_WRITE_MODE=full.
+                if (
+                    skip_write_freeze_ptr
+                    and isinstance(spme_skip_write_flags, list)
+                    and any(sf > 0.0 for sf in spme_skip_write_flags)
+                ):
+                    prev_frame_idx = frame_idx + 1 if track_in_reverse else frame_idx - 1
+                    prev_out = None
+                    if prev_frame_idx >= 0:
+                        prev_out = output_dict[storage_key].get(prev_frame_idx, None)
+                    if prev_out is None and prev_frame_idx >= 0:
+                        other_key = (
+                            "cond_frame_outputs"
+                            if storage_key == "non_cond_frame_outputs"
+                            else "non_cond_frame_outputs"
+                        )
+                        prev_out = output_dict[other_key].get(prev_frame_idx, None)
+                    if isinstance(prev_out, dict):
+                        prev_ptr = prev_out.get("obj_ptr", None)
+                        curr_ptr = output_dict[storage_key][frame_idx].get("obj_ptr", None)
+                        if (
+                            isinstance(prev_ptr, torch.Tensor)
+                            and isinstance(curr_ptr, torch.Tensor)
+                            and prev_ptr.shape == curr_ptr.shape
+                            and curr_ptr.numel() > 0
+                        ):
+                            prev_ptr = prev_ptr.to(
+                                device=curr_ptr.device, dtype=curr_ptr.dtype
+                            )
+                            # Apply per-object freezing in-place (index-aligned).
+                            for j, sf in enumerate(spme_skip_write_flags):
+                                if sf > 0.0:
+                                    curr_ptr[j : j + 1] = prev_ptr[j : j + 1]
+                            output_dict[storage_key][frame_idx]["obj_ptr"] = curr_ptr
                 # for batched inference state, we also need to add per-object
                 # memory slides to support instance interactivity
                 self.tracker._add_output_per_object(

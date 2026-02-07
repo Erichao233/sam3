@@ -455,7 +455,19 @@ def main() -> None:
 
     ap.add_argument("--query-pool", type=str, default="top1", choices=["top1", "topk_weighted"])
     ap.add_argument("--query-topk", type=int, default=5)
-    ap.add_argument("--anchor-det-thr", type=float, default=0.3)
+    ap.add_argument("--anchor-det-thr", type=float, default=0.0)
+    ap.add_argument(
+        "--pointer-mode",
+        type=str,
+        default="hybrid",
+        choices=["top1", "per_object", "hybrid"],
+        help="How to pick semantic pointer signals for the tracked obj_id=0 during fusion training. "
+        "'per_object' matches detector masks to the tracker mask and uses the matched query embedding. "
+        "'top1' uses global query_top1. 'hybrid' falls back to top1 when matching fails.",
+    )
+    ap.add_argument("--match-iou-thr", type=float, default=0.1, help="IoU thr to match det mask -> tracked obj.")
+    ap.add_argument("--match-topk", type=int, default=20, help="Top-k dets to try for per-object matching (0=all).")
+    ap.add_argument("--score-thr-detection", type=float, default=0.3, help="Override model.score_threshold_detection.")
 
     ap.add_argument("--fusion-mode", type=str, default="film", choices=["film", "resid"])
     ap.add_argument("--fusion-alpha", type=float, default=0.05)
@@ -486,6 +498,8 @@ def main() -> None:
     os.environ["SAM3_SPME_QUERY_POOL"] = str(args.query_pool)
     os.environ["SAM3_SPME_QUERY_TOPK"] = str(int(args.query_topk))
     os.environ["SAM3_SPME_ANCHOR_DET_THR"] = str(float(args.anchor_det_thr))
+    os.environ["SAM3_SPME_PER_OBJECT"] = "1" if args.pointer_mode in {"per_object", "hybrid"} else "0"
+    os.environ["SAM3_SPME_KEEP_QUERIES"] = "1" if args.pointer_mode in {"per_object", "hybrid"} else "0"
 
     print("[DEBUG] Building SAM3 video model...", flush=True)
     model = build_sam3_video_model(
@@ -502,6 +516,8 @@ def main() -> None:
         print("[DEBUG] No overlay ckpt; using base SAM3 detector weights.", flush=True)
 
     model.to(device)
+    if hasattr(model, "score_threshold_detection"):
+        model.score_threshold_detection = float(args.score_thr_detection)
     model.eval()
     if hasattr(model, "spme_fusion_mem_film_mlp"):
         model.spme_fusion_mem_film_mlp.train()
@@ -691,7 +707,7 @@ def main() -> None:
                     frame_idx=0,
                     obj_id=0,
                     mask=init_mask_t,
-                    add_mask_to_memory=False,
+                    add_mask_to_memory=True,
                 )
                 model.tracker.propagate_in_video_preflight(tracker_state, run_mem_encoder=True)
                 current_out = output_dict["cond_frame_outputs"][0]
@@ -710,13 +726,80 @@ def main() -> None:
                     run_mem_encoder=True,
                 )
 
+            # Pointer selection for this tracked object (obj_id=0).
+            qv_sel = None
+            det_score_sel = None
+            qcos_sel = None
+            if str(args.pointer_mode) in {"per_object", "hybrid"}:
+                try:
+                    det_masks = det_out.get("mask", None)
+                    if isinstance(det_masks, torch.Tensor) and det_masks.numel() > 0:
+                        trk_logits = pred_masks_gpu
+                        if isinstance(trk_logits, torch.Tensor):
+                            if trk_logits.ndim == 4:
+                                trk_logits = trk_logits[0, 0]
+                            elif trk_logits.ndim == 3:
+                                trk_logits = trk_logits[0]
+                        trk_bin = (trk_logits.detach() > 0).to(dtype=torch.bool)
+
+                        det_masks_res = det_masks
+                        if det_masks_res.shape[-2:] != trk_bin.shape[-2:]:
+                            det_masks_res = F.interpolate(
+                                det_masks_res.detach().float().unsqueeze(1),
+                                size=trk_bin.shape[-2:],
+                                mode="bilinear",
+                                align_corners=False,
+                            ).squeeze(1)
+                        det_bin = (det_masks_res.detach() > 0).to(dtype=torch.bool)
+                        inter = (det_bin & trk_bin).sum(dim=(-1, -2)).float()
+                        union = (det_bin | trk_bin).sum(dim=(-1, -2)).float().clamp_min(1e-6)
+                        ious = inter / union
+
+                        match_thr = float(args.match_iou_thr)
+                        cand = (ious >= match_thr).nonzero(as_tuple=False).reshape(-1)
+                        match_topk = int(args.match_topk)
+                        if match_topk > 0 and int(cand.numel()) > match_topk:
+                            cand_ious = ious[cand]
+                            _, topk_idx = torch.topk(cand_ious, k=match_topk, largest=True)
+                            cand = cand[topk_idx]
+
+                        det_to_matched = (
+                            {int(i): np.asarray([0], dtype=np.int64) for i in cand.tolist()} if cand.numel() else {}
+                        )
+                        if det_to_matched:
+                            per_obj_ctx = model._build_spme_per_object_context(
+                                det_out=det_out,
+                                det_to_matched_trk_obj_ids=det_to_matched,
+                                new_det_fa_inds=np.asarray([], dtype=np.int64),
+                                new_det_obj_ids=np.asarray([], dtype=np.int64),
+                                feature_cache=feature_cache,
+                            )
+                            if isinstance(per_obj_ctx, dict):
+                                qv_sel = per_obj_ctx.get("spme_query_vec_by_obj", {}).get(0, None)
+                                det_score_sel = per_obj_ctx.get("spme_det_score_raw_by_obj", {}).get(0, None)
+                                qcos_sel = per_obj_ctx.get("spme_query_cos_by_obj", {}).get(0, None)
+                except Exception:
+                    qv_sel = None
+
+            if qv_sel is None and str(args.pointer_mode) in {"hybrid", "top1"}:
+                qv_sel = det_out.get("spme_query_vec", None)
+                det_score_sel = det_out.get("spme_det_score_raw", None)
+                qcos_sel = det_out.get("spme_query_cos", None)
+            if str(args.pointer_mode) == "top1":
+                qv_sel = det_out.get("spme_query_vec", None)
+                det_score_sel = det_out.get("spme_det_score_raw", None)
+                qcos_sel = det_out.get("spme_query_cos", None)
+
+            if qcos_sel is None and str(args.pointer_mode) == "hybrid":
+                qcos_sel = det_out.get("spme_query_cos", None)
+
             s_mem, s_obj = _apply_spme_fusion_edit(
                 model,
                 current_out,
-                query_vec=det_out.get("spme_query_vec", None),
-                det_score_raw=det_out.get("spme_det_score_raw", None),
+                query_vec=qv_sel,
+                det_score_raw=det_score_sel if det_score_sel is not None else det_out.get("spme_det_score_raw", None),
                 presence_prob=det_out.get("spme_presence_prob", None),
-                query_cos=det_out.get("spme_query_cos", None),
+                query_cos=qcos_sel if qcos_sel is not None else det_out.get("spme_query_cos", None),
                 base_alpha=float(args.fusion_alpha),
                 base_alpha_obj=float(args.fusion_alpha_obj),
                 det_thr=float(args.fusion_det_thr),

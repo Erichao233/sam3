@@ -140,13 +140,13 @@ def _mask_torch_from_np(mask_np01: np.ndarray, device: torch.device) -> torch.Te
     return (m > 0).to(device=device, non_blocking=True)
 
 
-def _freeze_gate_and_fusion_params(model: torch.nn.Module) -> list[str]:
+def _freeze_gate_and_fusion_params(model: torch.nn.Module, *, freeze_fusion: bool) -> list[str]:
     trainable: list[str] = []
     for name, p in model.named_parameters():
         if (
             name.startswith("spme_gate_mlp.")
             or name.startswith("spme_gate_fusion_mlp.")
-            or name.startswith("spme_fusion_")
+            or (name.startswith("spme_fusion_") and not bool(freeze_fusion))
         ):
             p.requires_grad = True
             trainable.append(name)
@@ -242,12 +242,15 @@ def _apply_gate_and_fusion(
                 mem = mem * (1.0 - gate_d)
         current_out["maskmem_features"] = mem
 
-    # Pointer blend/decay.
+    # Pointer blend/decay (uses fusion head if provided, else mean(mem_scale)).
     ptr = current_out.get("obj_ptr", None)
     if isinstance(ptr, torch.Tensor) and ptr.numel() > 0:
         ptr = ptr.detach().clone()
         gate_scalar = mem_scale.mean(dim=-1, keepdim=True)
-        gate_w = gate_scalar.to(device=ptr.device, dtype=ptr.dtype).view(1, 1)
+        if isinstance(gate_fusion, torch.Tensor):
+            gate_w = gate_fusion.to(device=ptr.device, dtype=ptr.dtype).view(1, 1)
+        else:
+            gate_w = gate_scalar.to(device=ptr.device, dtype=ptr.dtype).view(1, 1)
         gate_d = gate_decay.to(device=ptr.device, dtype=ptr.dtype).view(1, 1)
         prev_ptr = prev_out.get("obj_ptr", None) if isinstance(prev_out, dict) else None
         if isinstance(prev_ptr, torch.Tensor) and prev_ptr.shape == ptr.shape:
@@ -260,7 +263,7 @@ def _apply_gate_and_fusion(
             ptr = ptr * (1.0 - gate_d)
         current_out["obj_ptr"] = ptr
 
-    # Semantic fusion injection (scaled by a scalar derived from mean(mem_scale)).
+    # Semantic fusion injection (scaled by fusion head if provided, else mean(mem_scale)).
     if query_vec is None or not isinstance(query_vec, torch.Tensor) or query_vec.numel() == 0:
         return
     if base_alpha <= 0.0 and base_alpha_obj <= 0.0:
@@ -282,7 +285,13 @@ def _apply_gate_and_fusion(
     if base_alpha > 0.0:
         mem = current_out.get("maskmem_features", None)
         if isinstance(mem, torch.Tensor) and mem.numel() > 0:
-            mem = mem.detach().clone()
+            # NOTE: `mem` can be an "InferenceTensor" when coming directly from Tracker's
+            # inference-mode helpers (e.g., `propagate_in_video_preflight`). In that case
+            # it cannot be saved for backward. However, if we already applied the learned
+            # gate above, `mem` is a normal tensor that *must* keep gradients so that
+            # `spme_gate_mlp` learns meaningful (input-dependent) behavior.
+            if not bool(mem.requires_grad):
+                mem = mem.detach().clone()
             mem_dim = int(mem.shape[1])
             scale_mem = torch.clamp(g_f * float(base_alpha), 0.0, 1.0).to(dtype=mem.dtype).view(1, 1, 1, 1)
             if fusion_mode in {"film", "filmedit"}:
@@ -309,7 +318,11 @@ def _apply_gate_and_fusion(
     if base_alpha_obj > 0.0:
         ptr = current_out.get("obj_ptr", None)
         if isinstance(ptr, torch.Tensor) and ptr.numel() > 0:
-            ptr = ptr.detach().clone()
+            # Same logic as memory: only clone/detach if it's an inference tensor.
+            # If pointer was updated by the learned gate above, keep gradients so the
+            # gate can learn to modulate pointer updates for identity stability.
+            if not bool(ptr.requires_grad):
+                ptr = ptr.detach().clone()
             scale_obj = torch.clamp(g_f * float(base_alpha_obj), 0.0, 1.0).to(dtype=ptr.dtype).view(1, 1)
             delta = model.spme_fusion_obj_ptr_mlp(qv).to(device=ptr.device, dtype=ptr.dtype)
             current_out["obj_ptr"] = ptr + delta * scale_obj
@@ -403,6 +416,8 @@ def _choose_clip(
     rng: random.Random,
     sequences: list[IndexedSequence],
     clip_len: int,
+    supervise_frame: int,
+    prefer_absent_supervise: float,
     min_init_area: int,
     allowed_classes: list[int] | None,
 ) -> ClipSpec | None:
@@ -424,6 +439,17 @@ def _choose_clip(
         return None
     if _bbox_xyxy_from_mask(mask0) is None:
         return None
+
+    # Oversample hard cases where the object becomes absent by the supervise frame.
+    p_prefer = float(prefer_absent_supervise)
+    if p_prefer > 0.0:
+        sup_idx = int(start + int(supervise_frame))
+        if 0 <= sup_idx < len(seq.labels):
+            lbl_sup = _load_label_bmp(seq.labels[sup_idx])
+            is_present_sup = bool((lbl_sup == int(class_id)).any())
+            # Reject a "present-at-supervise" clip with probability p_prefer.
+            if is_present_sup and rng.random() < p_prefer:
+                return None
     return ClipSpec(seq_id=int(seq.seq_id), start=int(start), length=int(clip_len), class_id=int(class_id))
 
 
@@ -488,6 +514,13 @@ def main() -> None:
     ap.add_argument("--bce-weight", type=float, default=1.0)
     ap.add_argument("--dice-weight", type=float, default=1.0)
     ap.add_argument("--absent-weight", type=float, default=0.0, help="Penalty on predicted area when GT is empty.")
+    ap.add_argument(
+        "--prefer-absent-supervise",
+        type=float,
+        default=0.0,
+        help="Rejection-sampling knob to oversample clips where the supervise frame is GT-empty for the chosen class. "
+        "If >0, we reject a present-at-supervise clip with probability p (so p=0.7 keeps ~30% present clips).",
+    )
 
     ap.add_argument("--query-pool", type=str, default="top1", choices=["top1", "topk_weighted"])
     ap.add_argument("--query-topk", type=int, default=5)
@@ -534,6 +567,14 @@ def main() -> None:
     ap.add_argument("--log-every", type=int, default=50)
     ap.add_argument("--save-every", type=int, default=2000)
     ap.add_argument("--resume", type=str, default=None)
+    ap.add_argument(
+        "--freeze-fusion",
+        type=int,
+        default=0,
+        choices=[0, 1],
+        help="If 1, freeze spme_fusion_* projectors and train only the gate heads. "
+        "Recommended when the gate collapses to its initialization.",
+    )
     ap.add_argument("--grad-check", action="store_true", help="Run a tiny synthetic grad sanity check and exit.")
 
     args = ap.parse_args()
@@ -600,7 +641,7 @@ def main() -> None:
     if getattr(model, "spme_gate_mlp", None) is None:
         raise RuntimeError("spme_gate_mlp was not created. Is SAM3_SPME_LEARNED_GATE=1 set early enough?")
 
-    trainable = _freeze_gate_and_fusion_params(model)
+    trainable = _freeze_gate_and_fusion_params(model, freeze_fusion=bool(int(args.freeze_fusion)))
     print(f"Trainable params ({len(trainable)}):", flush=True)
     for n in trainable:
         print(f"  - {n}", flush=True)
@@ -671,6 +712,8 @@ def main() -> None:
             rng,
             sequences=seqs,
             clip_len=int(args.clip_len),
+            supervise_frame=int(args.supervise_frame),
+            prefer_absent_supervise=float(args.prefer_absent_supervise),
             min_init_area=int(args.min_init_area),
             allowed_classes=[int(x) for x in args.allowed_classes] if args.allowed_classes else None,
         )
@@ -786,6 +829,11 @@ def main() -> None:
         det_score_gate = 0.0
         qcos_gate = 1.0
         tracker_score_gate = 1.0
+        gate_mem_scale_mean = None
+        gate_mem_offset_mean_abs = None
+        gate_decay_mean = None
+        gate_fusion_mean = None
+        supervise_gt_empty = None
 
         # --- Forward unroll ---
         for local_t in range(int(args.clip_len)):
@@ -812,7 +860,7 @@ def main() -> None:
                     frame_idx=0,
                     obj_id=0,
                     mask=init_mask_t,
-                    add_mask_to_memory=False,
+                    add_mask_to_memory=True,
                 )
                 model.tracker.propagate_in_video_preflight(tracker_state, run_mem_encoder=True)
                 current_out = output_dict["cond_frame_outputs"][0]
@@ -828,10 +876,64 @@ def main() -> None:
                     point_inputs=point_inputs,
                     mask_inputs=None,
                     reverse=False,
-                    run_mem_encoder=(local_t <= int(args.gate_frame)),
+                    run_mem_encoder=True,
                 )
 
             storage_key = "cond_frame_outputs" if is_init else "non_cond_frame_outputs"
+
+            # Prime per-object anchors early so qcos at gate_frame is meaningful.
+            # Without this, when per-object context is first built at gate_frame, the anchor
+            # is created on-the-fly and qcos becomes 1.0 by definition (not informative).
+            if (
+                is_init
+                and int(args.gate_frame) > 0
+                and str(args.pointer_mode) in {"per_object", "hybrid"}
+            ):
+                try:
+                    det_masks = det_out.get("mask", None)
+                    if isinstance(det_masks, torch.Tensor) and det_masks.numel() > 0:
+                        trk_logits = pred_masks_gpu
+                        if isinstance(trk_logits, torch.Tensor):
+                            if trk_logits.ndim == 4:
+                                trk_logits = trk_logits[0, 0]
+                            elif trk_logits.ndim == 3:
+                                trk_logits = trk_logits[0]
+                        trk_bin = (trk_logits.detach() > 0).to(dtype=torch.bool)
+
+                        det_masks_res = det_masks
+                        if det_masks_res.shape[-2:] != trk_bin.shape[-2:]:
+                            det_masks_res = F.interpolate(
+                                det_masks_res.detach().float().unsqueeze(1),
+                                size=trk_bin.shape[-2:],
+                                mode="bilinear",
+                                align_corners=False,
+                            ).squeeze(1)
+                        det_bin = (det_masks_res.detach() > 0).to(dtype=torch.bool)
+                        inter = (det_bin & trk_bin).sum(dim=(-1, -2)).float()
+                        union = (det_bin | trk_bin).sum(dim=(-1, -2)).float().clamp_min(1e-6)
+                        ious = inter / union
+
+                        match_thr = float(args.match_iou_thr)
+                        cand = (ious >= match_thr).nonzero(as_tuple=False).reshape(-1)
+                        match_topk = int(args.match_topk)
+                        if match_topk > 0 and int(cand.numel()) > match_topk:
+                            cand_ious = ious[cand]
+                            _, topk_idx = torch.topk(cand_ious, k=match_topk, largest=True)
+                            cand = cand[topk_idx]
+
+                        det_to_matched = (
+                            {int(i): np.asarray([0], dtype=np.int64) for i in cand.tolist()} if cand.numel() else {}
+                        )
+                        if det_to_matched:
+                            _ = model._build_spme_per_object_context(
+                                det_out=det_out,
+                                det_to_matched_trk_obj_ids=det_to_matched,
+                                new_det_fa_inds=np.asarray([], dtype=np.int64),
+                                new_det_obj_ids=np.asarray([], dtype=np.int64),
+                                feature_cache=feature_cache,
+                            )
+                except Exception:
+                    pass
 
             if local_t == int(args.gate_frame):
                 prev_frame_idx = int(local_t) - 1
@@ -957,6 +1059,25 @@ def main() -> None:
                 if isinstance(fusion_head, torch.nn.Module):
                     gate_fusion = torch.sigmoid(fusion_head(x_gate))
 
+                # Log-friendly scalars (detach to avoid graph bloat).
+                try:
+                    gate_mem_scale_mean = float(mem_scale.detach().float().mean().item())
+                except Exception:
+                    gate_mem_scale_mean = None
+                try:
+                    gate_mem_offset_mean_abs = float(mem_offset.detach().float().abs().mean().item())
+                except Exception:
+                    gate_mem_offset_mean_abs = None
+                try:
+                    gate_decay_mean = float(gate_decay.detach().float().mean().item())
+                except Exception:
+                    gate_decay_mean = None
+                if isinstance(gate_fusion, torch.Tensor):
+                    try:
+                        gate_fusion_mean = float(gate_fusion.detach().float().mean().item())
+                    except Exception:
+                        gate_fusion_mean = None
+
                 _apply_gate_and_fusion(
                     model,
                     current_out,
@@ -979,10 +1100,11 @@ def main() -> None:
                 if logits.ndim == 4 and logits.shape[1] == 1:
                     logits = logits[:, 0]
                 gt_lr = masks_lr[local_t]
+                supervise_gt_empty = bool(float(gt_lr.detach().sum().item()) <= 0.0)
                 bce = F.binary_cross_entropy_with_logits(logits.squeeze(0), gt_lr, reduction="mean")
                 dice = _dice_loss_from_logits(logits.squeeze(0), gt_lr)
                 loss = float(args.bce_weight) * bce + float(args.dice_weight) * dice
-                if float(gt_lr.detach().sum().item()) <= 0.0 and float(args.absent_weight) > 0.0:
+                if supervise_gt_empty and float(args.absent_weight) > 0.0:
                     ghost = torch.sigmoid(logits).mean()
                     loss = loss + float(args.absent_weight) * ghost
                 loss.backward()
@@ -1018,6 +1140,11 @@ def main() -> None:
                 "gate_tracker_score": float(tracker_score_gate),
                 "gate_area_delta": float(delta),
                 "gate_last_occluded_norm": float(last_occ),
+                "gate_mem_scale_mean": gate_mem_scale_mean,
+                "gate_mem_offset_mean_abs": gate_mem_offset_mean_abs,
+                "gate_decay": gate_decay_mean,
+                "gate_fusion": gate_fusion_mean,
+                "supervise_gt_empty": supervise_gt_empty,
             }
             with log_path.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(row) + "\n")

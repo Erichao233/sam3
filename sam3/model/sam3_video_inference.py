@@ -1500,6 +1500,21 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
                 for frame_id in rank0_metadata["suppressed_obj_ids"]:
                     rank0_metadata["suppressed_obj_ids"][frame_id].discard(obj_id)
 
+            # Hotstart bookkeeping expects every tracked obj_id to have a first-frame index.
+            # When objects are created from detector outputs, this is recorded in `_process_hotstart`.
+            # For mask-init objects (semi-supervised init), we must seed it here to avoid KeyError
+            # and to prevent hotstart heuristics from treating the object as "never appeared".
+            if "obj_first_frame_idx" in rank0_metadata:
+                try:
+                    rank0_metadata["obj_first_frame_idx"].setdefault(int(obj_id), int(frame_idx))
+                except Exception:
+                    pass
+            if "trk_keep_alive" in rank0_metadata:
+                try:
+                    rank0_metadata["trk_keep_alive"][int(obj_id)] = int(self.init_trk_keep_alive)
+                except Exception:
+                    pass
+
             if "masklet_confirmation" in rank0_metadata:
                 obj_ids_all_gpu = tracker_metadata["obj_ids_all_gpu"]
                 obj_indices = np.where(obj_ids_all_gpu == obj_id)[0]

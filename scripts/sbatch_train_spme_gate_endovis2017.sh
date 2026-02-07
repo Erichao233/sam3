@@ -4,7 +4,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
-#SBATCH -t 12:00:00
+#SBATCH -t 06:00:00
 #SBATCH -J sam3_endovis2017_train_spme_gate
 #SBATCH -o /home2020/home/icube/kunyuan/SurgBench/SAM/logs/%x-%j.out
 #SBATCH -e /home2020/home/icube/kunyuan/SurgBench/SAM/logs/%x-%j.err
@@ -33,7 +33,8 @@ SAM3_PT=$REPO/sam3.pt
 BPE=$REPO/sam3/assets/bpe_simple_vocab_16e6.txt.gz
 
 # Optional: detector/domain-adaptation checkpoint (Hydra trainer ckpt with ['model']).
-OVERLAY_CKPT="${OVERLAY_CKPT:-/home2020/home/icube/kunyuan/SurgBench/SAM/outputs/sam3_endovis2017_ft_boxprompt/checkpoints/checkpoint_40.pt}"
+# Default: empty (train SPME modules without EndoVis detector adaptation unless explicitly provided).
+OVERLAY_CKPT="${OVERLAY_CKPT:-}"
 
 # Optional: initialize spme_* from a fusion checkpoint before learning the gate.
 SPME_INIT_CKPT="${SPME_INIT_CKPT:-}"
@@ -53,15 +54,15 @@ MIN_INIT_AREA="${MIN_INIT_AREA:-50}"
 PROMPT_MODE="${PROMPT_MODE:-visual}"   # class | generic | visual
 PROMPT="${PROMPT:-surgical instrument}" # only used when PROMPT_MODE=generic
 
-# 2-frame unroll (with init at t=0).
-CLIP_LEN="${CLIP_LEN:-3}"
+# Unroll (init at t=0). You can increase the gap (supervise_frame - gate_frame) to make occlusion learning easier.
+CLIP_LEN="${CLIP_LEN:-4}"
 GATE_FRAME="${GATE_FRAME:-1}"
-SUPERVISE_FRAME="${SUPERVISE_FRAME:-2}"
+SUPERVISE_FRAME="${SUPERVISE_FRAME:-3}"
 INIT_PROMPT="${INIT_PROMPT:-mask}"  # mask | box
 IMAGE_SIZE="${IMAGE_SIZE:-1008}"    # must match SAM3 internal size (avoid RoPE mismatch)
 
-# Stop by wallclock to match SLURM.
-MAX_HOURS="${MAX_HOURS:-11.5}"
+# Stop by wallclock to match SLURM (leave a small buffer for packing logs/ckpts).
+MAX_HOURS="${MAX_HOURS:-5.8}"
 
 # Optim.
 LR="${LR:-5e-4}"
@@ -72,7 +73,10 @@ SEED="${SEED:-123}"
 # Loss.
 BCE_W="${BCE_W:-1.0}"
 DICE_W="${DICE_W:-1.0}"
-ABSENT_W="${ABSENT_W:-0.1}" # keep small to avoid "over-kill" early in occlusions
+# If the learned gate collapses to its init (do-nothing), increase ABSENT_W and/or oversample absent supervise frames.
+ABSENT_W="${ABSENT_W:-0.1}"
+PREFER_ABSENT_SUPERVISE="${PREFER_ABSENT_SUPERVISE:-0.7}"  # reject present-at-supervise clips with prob p
+FREEZE_FUSION="${FREEZE_FUSION:-1}"                         # 1 => train gate heads first (recommended)
 
 # SPME signals.
 QUERY_POOL="${QUERY_POOL:-top1}"
@@ -81,19 +85,19 @@ ANCHOR_DET_THR="${ANCHOR_DET_THR:-0.0}"
 POINTER_MODE="${POINTER_MODE:-hybrid}" # top1 | per_object | hybrid
 MATCH_IOU_THR="${MATCH_IOU_THR:-0.1}"
 MATCH_TOPK="${MATCH_TOPK:-20}"
-SCORE_THR_DET="${SCORE_THR_DET:-0.3}"
+SCORE_THR_DET="${SCORE_THR_DET:-0.2}"
 
 # Gate settings.
 GATE_USE_DECAY="${GATE_USE_DECAY:-1}"
 GATE_OCC_NORM="${GATE_OCC_NORM:-10.0}"
 GATE_INPUTS="${GATE_INPUTS:-full}"          # full | det3 | det4 (must match eval)
-FUSION_HEAD="${FUSION_HEAD:-0}"            # 0 | 1 (decouple fusion strength)
+FUSION_HEAD="${FUSION_HEAD:-1}"            # 0 | 1 (decouple fusion strength)
 DET_PRESENT_THR="${DET_PRESENT_THR:-0.3}"  # only relevant for det4
 
 # (Optional) fusion injection during gate training (kept small).
 FUSION_MODE="${FUSION_MODE:-film}"
-FUSION_ALPHA="${FUSION_ALPHA:-0.05}"
-FUSION_ALPHA_OBJ="${FUSION_ALPHA_OBJ:-0.005}"
+FUSION_ALPHA="${FUSION_ALPHA:-0.01}"
+FUSION_ALPHA_OBJ="${FUSION_ALPHA_OBJ:-0.001}"
 
 LOG_EVERY="${LOG_EVERY:-50}"
 SAVE_EVERY="${SAVE_EVERY:-2000}"
@@ -101,13 +105,21 @@ SAVE_EVERY="${SAVE_EVERY:-2000}"
 cd "$REPO"
 mkdir -p "$OUT_ROOT"
 
+# Auto-pick latest fusion checkpoint for initialization (optional).
+# Override SPME_INIT_CKPT explicitly if you want to pin a specific run.
+DEFAULT_CKPT_ROOT="/home2020/home/icube/kunyuan/SurgBench/SAM/outputs"
+FUSION_CKPT_DIR="${FUSION_CKPT_DIR:-$DEFAULT_CKPT_ROOT/endovis2017_spme_fusion_train_v1}"
+if [[ -z "$SPME_INIT_CKPT" ]]; then
+  SPME_INIT_CKPT="$(ls -t "$FUSION_CKPT_DIR"/job_*/main/checkpoints/spme_fusion_latest.pt 2>/dev/null | head -n1 || true)"
+fi
+
 echo "OUT_ROOT=$OUT_ROOT"
 echo "DATA=$DATA"
 echo "OVERLAY_CKPT=$OVERLAY_CKPT"
 echo "SPME_INIT_CKPT=${SPME_INIT_CKPT:-<none>}"
 echo "TRAIN_SEQS=$TRAIN_SEQS ALLOWED_CLASSES=${ALLOWED_CLASSES:-<all>}"
 echo "PROMPT_MODE=$PROMPT_MODE PROMPT=$PROMPT"
-echo "GATE_INPUTS=$GATE_INPUTS FUSION_HEAD=$FUSION_HEAD DET_PRESENT_THR=$DET_PRESENT_THR"
+echo "GATE_INPUTS=$GATE_INPUTS FUSION_HEAD=$FUSION_HEAD DET_PRESENT_THR=$DET_PRESENT_THR PREFER_ABSENT_SUPERVISE=$PREFER_ABSENT_SUPERVISE FREEZE_FUSION=$FREEZE_FUSION"
 
 if [[ "$PREPARE_DATA" == "1" || ( "$PREPARE_DATA" == "auto" && ! -d "$DATA/train/image" ) ]]; then
   echo "=== [0/1] Prepare official EndoVis2017 -> canonical layout ==="
@@ -151,6 +163,7 @@ python -u scripts/train_spme_gate_endovis2017.py \
   --bce-weight "$BCE_W" \
   --dice-weight "$DICE_W" \
   --absent-weight "$ABSENT_W" \
+  --prefer-absent-supervise "$PREFER_ABSENT_SUPERVISE" \
   --query-pool "$QUERY_POOL" \
   --query-topk "$QUERY_TOPK" \
   --anchor-det-thr "$ANCHOR_DET_THR" \
@@ -166,6 +179,7 @@ python -u scripts/train_spme_gate_endovis2017.py \
   --fusion-mode "$FUSION_MODE" \
   --fusion-alpha "$FUSION_ALPHA" \
   --fusion-alpha-obj "$FUSION_ALPHA_OBJ" \
+  --freeze-fusion "$FREEZE_FUSION" \
   --log-every "$LOG_EVERY" \
   --save-every "$SAVE_EVERY" \
   ${RESUME:+--resume "$RESUME"}
