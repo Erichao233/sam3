@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-EndoVis 2017 Instrument Segmentation Evaluation with SAM3.
+EndoVis 2018 Instrument Segmentation Evaluation with SAM3.
 
 Key features:
 - Tracks each instrument class as a separate single-object problem
@@ -8,8 +8,8 @@ Key features:
 - Supports SPME-W (write gate) and SPME-F (fusion) via environment variables
 
 Usage:
-    python scripts/eval_endovis2017.py \
-        --data-root /path/to/endovis2017 \
+    python scripts/eval_endovis2018.py \
+        --data-root /path/to/endovis2018 \
         --sequences val1 val2 val3 \
         --out-dir /path/to/output \
         --base-sam3-pt /path/to/sam3.pt \
@@ -43,13 +43,18 @@ from sam3.model.sam3_video_inference import Sam3VideoInference
 # ============================================================================
 
 INSTRUMENT_CLASSES = {
-    1: "Bipolar Forceps",
-    2: "Prograsp Forceps",
-    3: "Large Needle Driver",
-    4: "Vessel Sealer",
-    5: "Grasping Retractor",
-    6: "Monopolar Curved Scissors",
-    7: "Other",
+    0: "background-tissue",
+    1: "instrument-shaft",
+    2: "instrument-clasper",
+    3: "instrument-wrist",
+    4: "kidney-parenchyma",
+    5: "covered-kidney",
+    6: "thread",
+    7: "clamps",
+    8: "suturing-needle",
+    9: "suction-instrument",
+    10: "small-intestine",
+    11: "ultrasound-probe",
 }
 
 
@@ -67,6 +72,10 @@ def get_sequence_frames(data_root: Path, seq_name: str):
     seq_dir = data_root / seq_name
     image_dir = seq_dir / "image"
     label_dir = seq_dir / "label"
+
+    if not image_dir.is_dir() or not label_dir.is_dir():
+        print(f"[warn] Missing image/label dirs for sequence {seq_name}: {seq_dir}")
+        return []
     
     frames = []
     allowed_exts = [".png", ".bmp", ".jpg", ".jpeg"]
@@ -946,9 +955,9 @@ def _apply_spme_fusion_ckpt(video_model, spme_ckpt: Path) -> None:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate SAM3 on EndoVis 2017")
+    parser = argparse.ArgumentParser(description="Evaluate SAM3 on EndoVis 2018")
     parser.add_argument("--data-root", type=str, required=True,
-                        help="Path to endovis2017 directory")
+                        help="Path to endovis2018 directory (canonical layout)")
     parser.add_argument("--sequences", type=str, nargs="+", default=["val1"],
                         help="Sequences to evaluate (e.g., val1 val2 val3)")
     parser.add_argument("--out-dir", type=str, required=True,

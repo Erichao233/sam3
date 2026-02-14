@@ -1,57 +1,69 @@
 #!/bin/bash
+# sbatch_train_endovis2017_mem15.sh
+#
+# Plan: Retrain SPME-Gate on a 15-frame memory horizon.
+#
+# Logic:
+# - Scale: Gate MLP is small, 1 GPU is sufficient (unlike det finetuning).
+# - Memory: Clip=16 is IO/VRAM heavy, requesting 128GB and long runtime.
+# - Env: Must export SAM3_SPME_GATE_HIDDEN (used by model builder).
+# - Paths: Executed from REPO root.
+
 #SBATCH -A qoscammagpu2
 #SBATCH -p pri2021gpu
 #SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=8
+#SBATCH --cpus-per-task=16
 #SBATCH --mem=128G
-#SBATCH -t 08:00:00
-#SBATCH -J sam3_endovis2017_train_spme_gate
-#SBATCH -o /home2020/home/icube/kunyuan/SurgBench/SAM/logs/%x-%j.out
-#SBATCH -e /home2020/home/icube/kunyuan/SurgBench/SAM/logs/%x-%j.err
+#SBATCH -t 48:00:00
+#SBATCH -J spme_train_mem15
+#SBATCH -o /home2020/home/icube/kunyuan/SurgBench/SAM/logs/%x-%A.out
+#SBATCH -e /home2020/home/icube/kunyuan/SurgBench/SAM/logs/%x-%A.err
 
 set -euo pipefail
 
+# --- Environment Setup ---
+# 1. Initialize Conda (Crucial!)
 source /home2020/home/icube/kunyuan/anaconda3/etc/profile.d/conda.sh
 conda activate sam3
 
+# 2. Key Exports
 export OMP_NUM_THREADS=8
 export HYDRA_FULL_ERROR=1
 export SAM3_DISABLE_TRITON=1
 export PYTHONUNBUFFERED=1
 
-# Memory expansion (must match the checkpoint + eval protocol).
-# NOTE: requires server to have the corresponding `sam3/model_builder.py` changes synced.
-export SAM3_TRACKER_NUM_MASKMEM="${SAM3_TRACKER_NUM_MASKMEM:-15}"
-
-# Gate MLP width (read by sam3/model/sam3_video_base.py at model construction time).
+# 3. Model Config (Must match eval script)
 export SAM3_SPME_GATE_HIDDEN="${SAM3_SPME_GATE_HIDDEN:-64}"
+export SAM3_TRACKER_NUM_MASKMEM="15"  # Validates logic + triggers interpolation
 
-REPO=/home2020/home/icube/kunyuan/SurgBench/SAM/sam3
-DATA=/home2020/home/icube/kunyuan/SurgBench/surgicaltool/endovis2017
+# --- Paths ---
+REPO="/home2020/home/icube/kunyuan/SurgBench/SAM/sam3"
+cd "$REPO"
+
+DATA="/home2020/home/icube/kunyuan/SurgBench/surgicaltool/endovis2017"
 # Official EndoVis2017 release (raw). Used only when PREPARE_DATA is enabled.
 ENDOVIS_SRC="${ENDOVIS_SRC:-/home2020/home/icube/kunyuan/SurgBench/surgicaltool/Endovis2017}"
 PREPARE_DATA="${PREPARE_DATA:-auto}"  # 0 | 1 | auto
 CAMERA="${CAMERA:-left}"  # left | right
 
-SAM3_PT=$REPO/sam3.pt
-BPE=$REPO/sam3/assets/bpe_simple_vocab_16e6.txt.gz
+SAM3_PT="$REPO/sam3.pt"
+BPE_PATH="$REPO/sam3/assets/bpe_simple_vocab_16e6.txt.gz"
 
 # Optional: detector/domain-adaptation checkpoint (Hydra trainer ckpt with ['model']).
 # Default: empty (train SPME modules without EndoVis detector adaptation unless explicitly provided).
 OVERLAY_CKPT="${OVERLAY_CKPT:-}"
 
 # Optional: initialize spme_* from a fusion checkpoint before learning the gate.
-# Default: pin to the finished fusion run (clip16 + mem15) for reproducibility.
-SPME_INIT_CKPT="${SPME_INIT_CKPT:-/home2020/home/icube/kunyuan/SurgBench/SAM/outputs/endovis2017_spme_fusion_train_clip16_mem15/job_16149223/main/checkpoints/spme_fusion_latest.pt}"
+SPME_INIT_CKPT="${SPME_INIT_CKPT:-}"
 
 # Output folder (job-scoped for easy download).
-OUT_ROOT="${OUT_ROOT:-/home2020/home/icube/kunyuan/SurgBench/SAM/outputs/endovis2017_spme_gate_train_clip16_mem15/job_${SLURM_JOB_ID:-local}}"
+OUT_DIR="${OUT_ROOT:-/home2020/home/icube/kunyuan/SurgBench/SAM/outputs/endovis2017_spme_gate_train_mem15/job_${SLURM_JOB_ID:-local}}"
 
 # Optional: resume from an earlier gate run (spme_gate_latest.pt).
 RESUME="${RESUME:-}"
 
 # Train data selection.
-TRAIN_SEQS="${TRAIN_SEQS:-1 2 3 4 5 6 7 8}"
+TRAIN_SEQS="${TRAIN_SEQS:-1 2 3 4 5 6 7}"
 ALLOWED_CLASSES="${ALLOWED_CLASSES:-}" # e.g. "3 6"
 MIN_INIT_AREA="${MIN_INIT_AREA:-50}"
 
@@ -59,22 +71,18 @@ MIN_INIT_AREA="${MIN_INIT_AREA:-50}"
 PROMPT_MODE="${PROMPT_MODE:-visual}"   # class | generic | visual
 PROMPT="${PROMPT:-surgical instrument}" # only used when PROMPT_MODE=generic
 
-# Unroll (init at t=0).
-# Default aligns with the current "15-frame" setting in `scripts/train_spme_gate_endovis2017.py`
-# (clip_len=16, gate_frame=14, supervise_frame=15).
+
+# --- Training Hyperparameters ---
+# Unroll (init at t=0). You can increase the gap (supervise_frame - gate_frame) to make occlusion learning easier.
+# ME: Overridden for 15-frame memory experiment
 CLIP_LEN="${CLIP_LEN:-16}"
 GATE_FRAME="${GATE_FRAME:-14}"
 SUPERVISE_FRAME="${SUPERVISE_FRAME:-15}"
-RANDOMIZE_GATE_FRAME="${RANDOMIZE_GATE_FRAME:-0}"   # 0|1
-GATE_FRAME_MIN="${GATE_FRAME_MIN:-1}"
-GATE_FRAME_MAX="${GATE_FRAME_MAX:--1}"
-SUPERVISE_GAP_MIN="${SUPERVISE_GAP_MIN:-1}"
-SUPERVISE_GAP_MAX="${SUPERVISE_GAP_MAX:-1}"
 INIT_PROMPT="${INIT_PROMPT:-mask}"  # mask | box
 IMAGE_SIZE="${IMAGE_SIZE:-1008}"    # must match SAM3 internal size (avoid RoPE mismatch)
 
 # Stop by wallclock to match SLURM (leave a small buffer for packing logs/ckpts).
-MAX_HOURS="${MAX_HOURS:-7.6}"
+MAX_HOURS="${MAX_HOURS:-47.8}"
 
 # Optim.
 LR="${LR:-5e-4}"
@@ -91,7 +99,7 @@ PREFER_ABSENT_SUPERVISE="${PREFER_ABSENT_SUPERVISE:-0.7}"  # reject present-at-s
 FREEZE_FUSION="${FREEZE_FUSION:-1}"                         # 1 => train gate heads first (recommended)
 
 # SPME signals.
-QUERY_POOL="${QUERY_POOL:-top1}"
+QUERY_POOL="${QUERY_POOL:-topk_weighted}"
 QUERY_TOPK="${QUERY_TOPK:-5}"
 ANCHOR_DET_THR="${ANCHOR_DET_THR:-0.0}"
 POINTER_MODE="${POINTER_MODE:-hybrid}" # top1 | per_object | hybrid
@@ -113,35 +121,25 @@ FUSION_ALPHA_OBJ="${FUSION_ALPHA_OBJ:-0.001}"
 
 LOG_EVERY="${LOG_EVERY:-50}"
 SAVE_EVERY="${SAVE_EVERY:-2000}"
+MAX_STEPS="${MAX_STEPS:-50000}"  # ME: Added explicitly for long training
 
-cd "$REPO"
-mkdir -p "$OUT_ROOT"
+mkdir -p "$OUT_DIR"
 
 # Auto-pick latest fusion checkpoint for initialization (optional).
 # Override SPME_INIT_CKPT explicitly if you want to pin a specific run.
 DEFAULT_CKPT_ROOT="/home2020/home/icube/kunyuan/SurgBench/SAM/outputs"
-FUSION_CKPT_DIR="${FUSION_CKPT_DIR:-$DEFAULT_CKPT_ROOT/endovis2017_spme_fusion_train_clip16_mem15}"
+FUSION_CKPT_DIR="${FUSION_CKPT_DIR:-$DEFAULT_CKPT_ROOT/endovis2017_spme_fusion_train_v1}"
 if [[ -z "$SPME_INIT_CKPT" ]]; then
   SPME_INIT_CKPT="$(ls -t "$FUSION_CKPT_DIR"/job_*/main/checkpoints/spme_fusion_latest.pt 2>/dev/null | head -n1 || true)"
 fi
 
-echo "OUT_ROOT=$OUT_ROOT"
+echo "OUT_DIR=$OUT_DIR"
 echo "DATA=$DATA"
 echo "OVERLAY_CKPT=$OVERLAY_CKPT"
 echo "SPME_INIT_CKPT=${SPME_INIT_CKPT:-<none>}"
-echo "SAM3_TRACKER_NUM_MASKMEM=$SAM3_TRACKER_NUM_MASKMEM"
 echo "TRAIN_SEQS=$TRAIN_SEQS ALLOWED_CLASSES=${ALLOWED_CLASSES:-<all>}"
 echo "PROMPT_MODE=$PROMPT_MODE PROMPT=$PROMPT"
 echo "GATE_INPUTS=$GATE_INPUTS FUSION_HEAD=$FUSION_HEAD DET_PRESENT_THR=$DET_PRESENT_THR PREFER_ABSENT_SUPERVISE=$PREFER_ABSENT_SUPERVISE FREEZE_FUSION=$FREEZE_FUSION"
-
-EXTRA_FRAME_ARGS=()
-if [[ "$RANDOMIZE_GATE_FRAME" == "1" ]]; then
-  EXTRA_FRAME_ARGS+=(--randomize-gate-frame)
-  EXTRA_FRAME_ARGS+=(--gate-frame-min "$GATE_FRAME_MIN")
-  EXTRA_FRAME_ARGS+=(--gate-frame-max "$GATE_FRAME_MAX")
-  EXTRA_FRAME_ARGS+=(--supervise-gap-min "$SUPERVISE_GAP_MIN")
-  EXTRA_FRAME_ARGS+=(--supervise-gap-max "$SUPERVISE_GAP_MAX")
-fi
 
 if [[ "$PREPARE_DATA" == "1" || ( "$PREPARE_DATA" == "auto" && ! -d "$DATA/train/image" ) ]]; then
   echo "=== [0/1] Prepare official EndoVis2017 -> canonical layout ==="
@@ -160,7 +158,7 @@ if [[ ! -d "$DATA/train/image" ]]; then
   exit 1
 fi
 
-python -u scripts/train_spme_gate_endovis2017.py \
+python -u sam3/scripts/train_spme_gate_endovis2017.py \
   --data-root "$DATA" \
   --train-seqs $TRAIN_SEQS \
   ${ALLOWED_CLASSES:+--allowed-classes $ALLOWED_CLASSES} \
@@ -168,18 +166,18 @@ python -u scripts/train_spme_gate_endovis2017.py \
   --prompt-mode "$PROMPT_MODE" \
   --prompt "$PROMPT" \
   --base-sam3-pt "$SAM3_PT" \
-  --bpe-path "$BPE" \
+  --bpe-path "$BPE_PATH" \
   ${OVERLAY_CKPT:+--overlay-ckpt "$OVERLAY_CKPT"} \
   ${SPME_INIT_CKPT:+--spme-init-ckpt "$SPME_INIT_CKPT"} \
-  --out-dir "$OUT_ROOT/main" \
+  --out-dir "$OUT_DIR/main" \
   --seed "$SEED" \
   --image-size "$IMAGE_SIZE" \
   --clip-len "$CLIP_LEN" \
   --init-prompt "$INIT_PROMPT" \
   --gate-frame "$GATE_FRAME" \
   --supervise-frame "$SUPERVISE_FRAME" \
-  "${EXTRA_FRAME_ARGS[@]}" \
   --max-hours "$MAX_HOURS" \
+  --max-steps "$MAX_STEPS" \
   --lr "$LR" \
   --weight-decay "$WEIGHT_DECAY" \
   --grad-clip "$GRAD_CLIP" \
@@ -207,5 +205,5 @@ python -u scripts/train_spme_gate_endovis2017.py \
   --save-every "$SAVE_EVERY" \
   ${RESUME:+--resume "$RESUME"}
 
-tar -czf "${OUT_ROOT}.tar.gz" -C "$(dirname "$OUT_ROOT")" "$(basename "$OUT_ROOT")"
-echo "Packed: ${OUT_ROOT}.tar.gz"
+tar -czf "${OUT_DIR}.tar.gz" -C "$(dirname "$OUT_DIR")" "$(basename "$OUT_DIR")"
+echo "Packed: ${OUT_DIR}.tar.gz"

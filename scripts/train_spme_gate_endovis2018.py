@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Train learned SPME gate (channel-wise FiLM + decay) on EndoVis 2017 train split.
+Train learned SPME gate (channel-wise FiLM + decay) on EndoVis 2018 training releases.
 
 This mirrors `scripts/train_spme_gate.py` (OVIS) but uses EndoVis' per-frame labels
 under:
-  <data_root>/train/image/seq_<sid>_frameXXXX.(png|bmp)
-  <data_root>/train/label/seq_<sid>_frameXXXX.(png|bmp)
+  <data_root>/train/image/*seq_<sid>_frameXXXX.(png|bmp)
+  <data_root>/train/label/*seq_<sid>_frameXXXX.(png|bmp)
 
 Key idea (2-frame unroll):
   - t=0: init with GT mask (paper-aligned) or GT box (legacy)
@@ -31,6 +31,7 @@ import math
 import os
 import random
 import re
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -42,16 +43,25 @@ import torch.nn.functional as F
 import torchvision.transforms.functional as TF
 from PIL import Image
 
+# Add repo root to path (so running `python scripts/...` works without installing as a package).
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
+
 from sam3.model_builder import build_sam3_video_model
 
 INSTRUMENT_CLASSES = {
-    1: "Bipolar Forceps",
-    2: "Prograsp Forceps",
-    3: "Large Needle Driver",
-    4: "Vessel Sealer",
-    5: "Grasping Retractor",
-    6: "Monopolar Curved Scissors",
-    7: "Other",
+    0: "background-tissue",
+    1: "instrument-shaft",
+    2: "instrument-clasper",
+    3: "instrument-wrist",
+    4: "kidney-parenchyma",
+    5: "covered-kidney",
+    6: "thread",
+    7: "clamps",
+    8: "suturing-needle",
+    9: "suction-instrument",
+    10: "small-intestine",
+    11: "ultrasound-probe",
 }
 
 
@@ -63,8 +73,7 @@ def _seed_everything(seed: int) -> None:
 
 
 def _parse_seq_and_frame(name: str) -> tuple[int, int] | None:
-    # EndoVis2017 naming (train split): seq_<sid>_frameXXXX.bmp
-    m = re.match(r"^seq_(\d+)_frame(\d+)\.(bmp|png|jpg|jpeg)$", name, flags=re.IGNORECASE)
+    m = re.search(r"seq_(\d+)_frame(\d+)\.(bmp|png|jpg|jpeg)$", name, flags=re.IGNORECASE)
     if not m:
         return None
     return int(m.group(1)), int(m.group(2))
@@ -431,6 +440,8 @@ def _choose_clip(
     present = [int(c) for c in np.unique(lbl0) if int(c) in INSTRUMENT_CLASSES]
     if allowed_classes is not None:
         present = [c for c in present if c in set(allowed_classes)]
+    else:
+        present = [c for c in present if int(c) != 0]
     if not present:
         return None
     class_id = int(rng.choice(present))
@@ -455,14 +466,26 @@ def _choose_clip(
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--data-root", required=True, type=str, help="Path to endovis2017 root (contains train/)")
-    ap.add_argument("--train-seqs", type=int, nargs="*", default=[1, 2, 3, 4, 5, 6, 7], help="Sequence IDs to use.")
-    ap.add_argument("--allowed-classes", type=int, nargs="*", default=None, help="Optional instrument class IDs to train.")
+    ap.add_argument("--data-root", required=True, type=str, help="Path to endovis2018_train root (contains train/)")
+    ap.add_argument(
+        "--train-seqs",
+        type=int,
+        nargs="*",
+        default=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+        help="Sequence IDs to use.",
+    )
+    ap.add_argument(
+        "--allowed-classes",
+        type=int,
+        nargs="*",
+        default=None,
+        help="Optional class IDs to train (default: all non-background classes present at init).",
+    )
     ap.add_argument("--min-init-area", type=int, default=50, help="Min init mask area (pixels) to avoid tiny masks.")
     ap.add_argument(
         "--prompt-mode",
         type=str,
-        default="class",
+        default="visual",
         choices=["class", "generic", "visual"],
         help="How to set the SAM3 text prompt. "
         "'class' uses the instrument name (often brittle). "

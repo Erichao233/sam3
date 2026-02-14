@@ -1197,11 +1197,22 @@ class Sam3VideoBase(nn.Module):
         reid_self_thr = float(os.getenv("SAM3_SPME_REID_SELF_THR", "0.0"))
         reid_use_other_banks = os.getenv("SAM3_SPME_REID_USE_OTHER_BANKS", "1") == "1"
         reid_update_bank = os.getenv("SAM3_SPME_REID_UPDATE", "1") == "1"
+        # If enabled, compare detector vs tracker consistency against the reference bank
+        # and only take drift/mismatch actions when detector is *more* consistent.
+        #
+        # This prevents false triggers when det↔trk masks disagree due to detector domain shift
+        # but the tracker is still correct (a common EndoVis failure mode).
+        reid_compare_trk_det = os.getenv("SAM3_SPME_REID_COMPARE_TRK_DET", "0") == "1"
+        reid_compare_margin = float(
+            os.getenv("SAM3_SPME_REID_COMPARE_MARGIN", str(reid_margin_thr))
+        )
         reid_bank_size = int(max(1, reid_bank_size))
         reid_best_sim_by_obj: Dict[int, float] = {}
         reid_margin_by_obj: Dict[int, float] = {}
         reid_accept_by_obj: Dict[int, int] = {}
         reid_bank_size_by_obj: Dict[int, int] = {}
+        reid_trk_sim_by_obj: Dict[int, float] = {}
+        reid_det_vs_trk_margin_by_obj: Dict[int, float] = {}
         bank_map: Dict[int, list[Tensor]] | None = None
         if reid_enabled:
             bank_map = feature_cache.setdefault("spme_reid_bank", {})
@@ -1313,6 +1324,7 @@ class Sam3VideoBase(nn.Module):
             reid_best_sim = float("nan")
             reid_margin = float("nan")
             reid_accept = False
+            trk_self_sim = None
             if (
                 reid_enabled
                 and det_present
@@ -1323,6 +1335,15 @@ class Sam3VideoBase(nn.Module):
             ):
                 bank = bank_map.get(int(obj_id), None)
                 if isinstance(bank, list) and len(bank) > 0:
+                    # Optional: compute tracker consistency against the bank (for det-vs-trk comparison).
+                    if reid_compare_trk_det and not bool(trk_empty):
+                        desc_trk = self._spme_reid_extract_descriptor(
+                            frame_idx=int(frame_idx),
+                            feature_cache=feature_cache,
+                            mask_lr=trk_bin.detach(),
+                        )
+                        if isinstance(desc_trk, torch.Tensor):
+                            trk_self_sim = self._spme_reid_mean_sim(desc_trk, bank)
                     det_bin_for_desc = det_masks[int(det_idx)] > 0
                     desc = self._spme_reid_extract_descriptor(
                         frame_idx=int(frame_idx),
@@ -1358,6 +1379,17 @@ class Sam3VideoBase(nn.Module):
             reid_best_sim_by_obj[int(obj_id)] = float(reid_best_sim)
             reid_margin_by_obj[int(obj_id)] = float(reid_margin)
             reid_accept_by_obj[int(obj_id)] = int(1 if reid_accept else 0)
+            if trk_self_sim is None:
+                reid_trk_sim_by_obj[int(obj_id)] = float("nan")
+                reid_det_vs_trk_margin_by_obj[int(obj_id)] = float("nan")
+            else:
+                reid_trk_sim_by_obj[int(obj_id)] = float(trk_self_sim)
+                try:
+                    reid_det_vs_trk_margin_by_obj[int(obj_id)] = float(
+                        float(reid_best_sim) - float(trk_self_sim)
+                    )
+                except Exception:
+                    reid_det_vs_trk_margin_by_obj[int(obj_id)] = float("nan")
 
             det_good = det_present and det_score >= reinit_det_thr and qcos >= reinit_qcos_thr
             if reid_enabled:
@@ -1438,6 +1470,12 @@ class Sam3VideoBase(nn.Module):
                 enable_mismatch
                 and det_good
                 and mismatch_new >= mismatch_thr
+                and (
+                    not reid_compare_trk_det
+                    or math.isnan(float(reid_det_vs_trk_margin_by_obj.get(int(obj_id), float("nan"))))
+                    or float(reid_det_vs_trk_margin_by_obj.get(int(obj_id), float("nan")))
+                    >= float(reid_compare_margin)
+                )
                 and (float(trk_score) < float(reinit_tracker_thr) or bool(reid_enabled))
                 and (not bool(trk_empty) or bool(allow_empty))
             ):
@@ -1460,6 +1498,9 @@ class Sam3VideoBase(nn.Module):
             state["reid_margin_by_obj"] = reid_margin_by_obj
             state["reid_accept_by_obj"] = reid_accept_by_obj
             state["reid_bank_size_by_obj"] = reid_bank_size_by_obj
+            if reid_compare_trk_det:
+                state["reid_trk_sim_by_obj"] = reid_trk_sim_by_obj
+                state["reid_det_vs_trk_margin_by_obj"] = reid_det_vs_trk_margin_by_obj
 
         return plan
 
@@ -1781,6 +1822,8 @@ class Sam3VideoBase(nn.Module):
             spme_reid_margin_by_obj: Dict[int, float] | None = None
             spme_reid_accept_by_obj: Dict[int, int] | None = None
             spme_reid_bank_size_by_obj: Dict[int, int] | None = None
+            spme_reid_trk_sim_by_obj: Dict[int, float] | None = None
+            spme_reid_det_vs_trk_margin_by_obj: Dict[int, float] | None = None
             if os.getenv("SAM3_SPME_REID", "0") == "1":
                 if self.rank == 0:
                     st = feature_cache.get("spme_reinit_state", {})
@@ -1789,6 +1832,10 @@ class Sam3VideoBase(nn.Module):
                         spme_reid_margin_by_obj = st.get("reid_margin_by_obj", None)
                         spme_reid_accept_by_obj = st.get("reid_accept_by_obj", None)
                         spme_reid_bank_size_by_obj = st.get("reid_bank_size_by_obj", None)
+                        spme_reid_trk_sim_by_obj = st.get("reid_trk_sim_by_obj", None)
+                        spme_reid_det_vs_trk_margin_by_obj = st.get(
+                            "reid_det_vs_trk_margin_by_obj", None
+                        )
                 if self.world_size > 1:
                     # Broadcast dicts from rank0 to keep logging consistent.
                     payload = (
@@ -1810,6 +1857,18 @@ class Sam3VideoBase(nn.Module):
                     )
                     self.broadcast_python_obj_cpu(payload, src=0)
                     spme_reid_bank_size_by_obj = payload[0]
+
+                    payload = (
+                        [spme_reid_trk_sim_by_obj] if self.rank == 0 else [None]
+                    )
+                    self.broadcast_python_obj_cpu(payload, src=0)
+                    spme_reid_trk_sim_by_obj = payload[0]
+
+                    payload = (
+                        [spme_reid_det_vs_trk_margin_by_obj] if self.rank == 0 else [None]
+                    )
+                    self.broadcast_python_obj_cpu(payload, src=0)
+                    spme_reid_det_vs_trk_margin_by_obj = payload[0]
 
             # det↔trk IoU (per object) for drift-aware fusion triggers and debug logging.
             #
@@ -1874,6 +1933,8 @@ class Sam3VideoBase(nn.Module):
                 spme_reid_margin_by_obj=spme_reid_margin_by_obj,
                 spme_reid_accept_by_obj=spme_reid_accept_by_obj,
                 spme_reid_bank_size_by_obj=spme_reid_bank_size_by_obj,
+                spme_reid_trk_sim_by_obj=spme_reid_trk_sim_by_obj,
+                spme_reid_det_vs_trk_margin_by_obj=spme_reid_det_vs_trk_margin_by_obj,
                 track_in_reverse=reverse,
             )
 
@@ -2596,6 +2657,8 @@ class Sam3VideoBase(nn.Module):
         spme_reid_margin_by_obj: Dict[int, float] | None = None,
         spme_reid_accept_by_obj: Dict[int, int] | None = None,
         spme_reid_bank_size_by_obj: Dict[int, int] | None = None,
+        spme_reid_trk_sim_by_obj: Dict[int, float] | None = None,
+        spme_reid_det_vs_trk_margin_by_obj: Dict[int, float] | None = None,
         track_in_reverse: bool = False,
     ):
         """
@@ -2766,6 +2829,17 @@ class Sam3VideoBase(nn.Module):
         #
         #   This reduces false skips caused by unreliable detections.
         skip_write_on_mismatch = os.getenv("SAM3_SPME_SKIP_WRITE_ON_MISMATCH", "0") == "1"
+        # Trigger mode for skip-write:
+        # - "mismatch" (default): det↔trk IoU < thr (legacy; can be unreliable under detector domain shift)
+        # - "tracker_score": tracker_score < thr (uncertainty-triggered memory hygiene)
+        # - "hybrid": both conditions (more conservative)
+        skip_write_event_mode = os.getenv("SAM3_SPME_SKIP_WRITE_EVENT_MODE", "mismatch").strip().lower()
+        skip_write_tracker_thr = float(
+            os.getenv(
+                "SAM3_SPME_SKIP_WRITE_TRACKER_THR",
+                str(fusion_tracker_thr if fusion_event_driven else 0.8),
+            )
+        )
         skip_write_mismatch_iou_thr = float(
             os.getenv(
                 "SAM3_SPME_SKIP_WRITE_MISMATCH_IOU_THR",
@@ -2777,6 +2851,17 @@ class Sam3VideoBase(nn.Module):
         skip_write_use_det_qcos = os.getenv("SAM3_SPME_SKIP_WRITE_USE_DET_QCOS", "0") == "1"
         skip_write_det_thr = float(os.getenv("SAM3_SPME_SKIP_WRITE_DET_THR", "0.7"))
         skip_write_qcos_thr = float(os.getenv("SAM3_SPME_SKIP_WRITE_QCOS_THR", "0.7"))
+        # Optional safety: require ReID evidence that detector is more consistent than tracker
+        # before skipping writes (prevents false skips when det masks are misaligned).
+        skip_write_require_reid_det_better = (
+            os.getenv("SAM3_SPME_SKIP_WRITE_REQUIRE_REID_DET_BETTER", "0") == "1"
+        )
+        skip_write_reid_margin = float(
+            os.getenv(
+                "SAM3_SPME_SKIP_WRITE_REID_MARGIN",
+                os.getenv("SAM3_SPME_REID_COMPARE_MARGIN", "0.01"),
+            )
+        )
 
         # Map tracker confidence to per-object scalars when available.
         trk_score_by_obj: Dict[int, float] | None = None
@@ -2975,17 +3060,17 @@ class Sam3VideoBase(nn.Module):
                 qcos_t = torch.tensor(qcos_vals, device=gate_dev, dtype=torch.float32)
                 det_t = torch.tensor(det_vals, device=gate_dev, dtype=torch.float32)
 
-                if gate_inputs_mode == "full":
-                    # Tracker score signal (mask quality / confidence).
-                    if (
-                        isinstance(tracker_obj_scores_global, torch.Tensor)
-                        and int(tracker_obj_scores_global.numel()) == int(high_res_masks.shape[0])
-                    ):
-                        tracker_logits_local = tracker_obj_scores_global[start_idx_state:end_idx_state]
-                        tracker_score = (
-                            tracker_logits_local.detach().float().sigmoid().clamp(0.0, 1.0)
-                        )
+                # Tracker score signal (mask quality / confidence), used both as an optional gate input
+                # ("full" mode) and for optional inference-time modulation.
+                if (
+                    isinstance(tracker_obj_scores_global, torch.Tensor)
+                    and int(tracker_obj_scores_global.numel()) == int(high_res_masks.shape[0])
+                ):
+                    tracker_logits_local = tracker_obj_scores_global[start_idx_state:end_idx_state]
+                    tracker_score = tracker_logits_local.detach().float().sigmoid().clamp(0.0, 1.0)
+                trk_t = tracker_score if tracker_score is not None else det_t.new_ones(det_t.shape)
 
+                if gate_inputs_mode == "full":
                     # Mask area + delta signal.
                     curr_area = (
                         torch.sigmoid(local_high_res_masks.detach().float())
@@ -3023,7 +3108,6 @@ class Sam3VideoBase(nn.Module):
                     for i, obj_id in enumerate(obj_ids_local):
                         prev_area_map[obj_id] = float(curr_area[i].item())
 
-                    trk_t = tracker_score if tracker_score is not None else det_t.new_ones(det_t.shape)
                     x = torch.stack([qcos_t, det_t, trk_t, area_delta, last_occluded_norm], dim=-1)
                 elif gate_inputs_mode == "det3":
                     # Detector-only ("clean") gate inputs: (qcos, det_score, presence_prob)
@@ -3100,11 +3184,14 @@ class Sam3VideoBase(nn.Module):
                 #   push (scale→1, offset→0, decay→0); when det_score is low, allow the learned edit.
                 #
                 # This is strictly inference-time and does not change checkpoint formats.
+                abs_w: torch.Tensor | None = None
+
+                # (1) Detector-based modulation (optionally with qcos consistency).
                 if os.getenv("SAM3_SPME_LEARNED_GATE_MODULATE_BY_DET", "0") == "1":
                     det_pow = _get_float_env("SAM3_SPME_LEARNED_GATE_MODULATE_BY_DET_POW", 1.0)
 
                     # Base confidence proxy: detector score.
-                    conf_t = det_t
+                    conf_det_t = det_t
 
                     # Optional: incorporate qcos consistency so that the gate can still intervene when
                     # det_score is high but inconsistent (e.g., false positives / drift signatures).
@@ -3127,12 +3214,31 @@ class Sam3VideoBase(nn.Module):
                             denom = max(1e-6, 1.0 - float(q_thr_m))
                             q_gate_val = ((qcos_t - float(q_thr_m)) / denom).clamp(0.0, 1.0)
 
-                        conf_t = (conf_t * q_gate_val).clamp(0.0, 1.0)
+                        conf_det_t = (conf_det_t * q_gate_val).clamp(0.0, 1.0)
 
-                    abs_w = (1.0 - conf_t).clamp(0.0, 1.0)
+                    abs_w_det = (1.0 - conf_det_t).clamp(0.0, 1.0)
                     if det_pow != 1.0:
-                        abs_w = abs_w.pow(float(det_pow))
+                        abs_w_det = abs_w_det.pow(float(det_pow))
+                    abs_w = abs_w_det if abs_w is None else (abs_w * abs_w_det)
 
+                # (2) Tracker-confidence modulation.
+                #
+                # Motivation:
+                # - On EndoVis, the detector can miss or be poorly calibrated on some stable sequences.
+                # - We want a "do-no-harm" envelope: when the tracker is confident, keep the learned gate
+                #   close to identity even if det_score is low; when the tracker is uncertain, allow edits.
+                #
+                # This is inference-time only; no checkpoint change.
+                if os.getenv("SAM3_SPME_LEARNED_GATE_MODULATE_BY_TRK", "0") == "1":
+                    trk_pow = _get_float_env("SAM3_SPME_LEARNED_GATE_MODULATE_BY_TRK_POW", 1.0)
+                    conf_trk_t = trk_t.detach().float().clamp(0.0, 1.0)
+                    if trk_pow != 1.0:
+                        conf_trk_t = conf_trk_t.pow(float(trk_pow))
+                    abs_w_trk = (1.0 - conf_trk_t).clamp(0.0, 1.0)
+                    abs_w = abs_w_trk if abs_w is None else (abs_w * abs_w_trk)
+
+                # Apply modulation if enabled.
+                if abs_w is not None:
                     abs_w_mem = abs_w.unsqueeze(-1)  # (N,1) for broadcasting
                     learned_gate_mem_scale_1d = 1.0 - (1.0 - learned_gate_mem_scale_1d) * abs_w_mem
                     learned_gate_mem_offset_1d = learned_gate_mem_offset_1d * abs_w_mem
@@ -3257,10 +3363,6 @@ class Sam3VideoBase(nn.Module):
                     else:
                         if gate_scale is not None and gate_offset is not None:
                             local_maskmem_features = local_maskmem_features * gate_scale + gate_offset
-                            if learned_gate_use_decay:
-                                local_maskmem_features = local_maskmem_features * (1.0 - gate_decay)
-                        elif learned_gate_use_decay:
-                            local_maskmem_features = local_maskmem_features * (1.0 - gate_decay)
                 else:
                     gate_local: Tensor | float | None = None
                     if gate_by_obj is not None:
@@ -3562,16 +3664,44 @@ class Sam3VideoBase(nn.Module):
             # not trigger skipping by default (conservative).
             spme_skip_write_1d: torch.Tensor | None = None
             spme_skip_write_flags: list[float] | None = None
-            if skip_write_on_mismatch and isinstance(spme_det_trk_iou_by_obj, dict) and obj_ids_local:
+            if skip_write_on_mismatch and obj_ids_local:
                 thr = max(1e-6, float(skip_write_mismatch_iou_thr))
                 skip_flags: list[float] = []
                 for obj_id in obj_ids_local:
-                    v = spme_det_trk_iou_by_obj.get(int(obj_id), None)
-                    try:
-                        miou = float(v) if v is not None else float("nan")
-                    except Exception:
-                        miou = float("nan")
-                    do_skip = (not math.isnan(miou)) and (miou < thr)
+                    # Determine whether this object should skip memory write.
+                    #
+                    # NOTE: det↔trk IoU mismatch can be unreliable under detector domain shift, so
+                    # we support uncertainty-triggered skip-write based on tracker_score.
+
+                    # (A) mismatch trigger (requires det↔trk IoU)
+                    miou = float("nan")
+                    if isinstance(spme_det_trk_iou_by_obj, dict):
+                        v = spme_det_trk_iou_by_obj.get(int(obj_id), None)
+                        try:
+                            miou = float(v) if v is not None else float("nan")
+                        except Exception:
+                            miou = float("nan")
+                    mismatch_skip = (not math.isnan(miou)) and (miou < thr)
+
+                    # (B) tracker-score trigger (requires tracker_score)
+                    ts = float("nan")
+                    if isinstance(trk_score_by_obj, dict) and int(obj_id) in trk_score_by_obj:
+                        try:
+                            ts = float(trk_score_by_obj.get(int(obj_id)))
+                        except Exception:
+                            ts = float("nan")
+                    score_skip = (not math.isnan(ts)) and (float(ts) < float(skip_write_tracker_thr))
+
+                    mode = skip_write_event_mode
+                    if mode in {"mismatch", "iou", "det_trk_iou"}:
+                        do_skip = mismatch_skip
+                    elif mode in {"tracker", "tracker_score", "score"}:
+                        do_skip = score_skip
+                    elif mode in {"hybrid", "both", "and"}:
+                        do_skip = bool(mismatch_skip and score_skip)
+                    else:
+                        # Unknown mode: fall back to mismatch behavior for backward compatibility.
+                        do_skip = mismatch_skip
                     if do_skip and skip_write_use_det_qcos:
                         # Require a reliable overseer signal before skipping writes.
                         det_f = (
@@ -3589,6 +3719,16 @@ class Sam3VideoBase(nn.Module):
                         det_ok = (not math.isnan(det_f)) and (det_f >= float(skip_write_det_thr))
                         q_ok = (not math.isnan(qcos_f)) and (qcos_f >= float(skip_write_qcos_thr))
                         do_skip = bool(det_ok and q_ok)
+                    if do_skip and skip_write_require_reid_det_better:
+                        m = (
+                            float(spme_reid_det_vs_trk_margin_by_obj.get(int(obj_id)))
+                            if isinstance(spme_reid_det_vs_trk_margin_by_obj, dict)
+                            and int(obj_id) in spme_reid_det_vs_trk_margin_by_obj
+                            else float("nan")
+                        )
+                        # Conservative: only skip when we have positive evidence that detector is
+                        # more consistent than tracker.
+                        do_skip = (not math.isnan(m)) and (m >= float(skip_write_reid_margin))
                     skip_flags.append(1.0 if do_skip else 0.0)
 
                 if any(x > 0.0 for x in skip_flags):
@@ -3664,6 +3804,8 @@ class Sam3VideoBase(nn.Module):
                         reid_margin_vals_out: list[float] = []
                         reid_accept_vals_out: list[float] = []
                         reid_bank_size_vals_out: list[float] = []
+                        reid_trk_sim_vals_out: list[float] = []
+                        reid_det_vs_trk_margin_vals_out: list[float] = []
                         for obj_id in obj_ids_local:
                             det_f = (
                                 float(spme_det_score_raw_by_obj.get(obj_id))
@@ -3717,6 +3859,18 @@ class Sam3VideoBase(nn.Module):
                                 and int(obj_id) in spme_reid_bank_size_by_obj
                                 else float("nan")
                             )
+                            reid_trk_sim_vals_out.append(
+                                float(spme_reid_trk_sim_by_obj.get(obj_id))
+                                if isinstance(spme_reid_trk_sim_by_obj, dict)
+                                and int(obj_id) in spme_reid_trk_sim_by_obj
+                                else float("nan")
+                            )
+                            reid_det_vs_trk_margin_vals_out.append(
+                                float(spme_reid_det_vs_trk_margin_by_obj.get(obj_id))
+                                if isinstance(spme_reid_det_vs_trk_margin_by_obj, dict)
+                                and int(obj_id) in spme_reid_det_vs_trk_margin_by_obj
+                                else float("nan")
+                            )
 
                         output_dict[storage_key][frame_idx]["spme_det_score_raw"] = (
                             torch.tensor(det_vals_out, dtype=torch.float32).view(-1, 1).cpu()
@@ -3744,6 +3898,12 @@ class Sam3VideoBase(nn.Module):
                         )
                         output_dict[storage_key][frame_idx]["spme_reid_bank_size"] = (
                             torch.tensor(reid_bank_size_vals_out, dtype=torch.float32).view(-1, 1).cpu()
+                        )
+                        output_dict[storage_key][frame_idx]["spme_reid_trk_sim"] = (
+                            torch.tensor(reid_trk_sim_vals_out, dtype=torch.float32).view(-1, 1).cpu()
+                        )
+                        output_dict[storage_key][frame_idx]["spme_reid_det_vs_trk_margin"] = (
+                            torch.tensor(reid_det_vs_trk_margin_vals_out, dtype=torch.float32).view(-1, 1).cpu()
                         )
 
                         if fusion_enabled and (base_alpha > 0.0 or base_alpha_obj > 0.0):
